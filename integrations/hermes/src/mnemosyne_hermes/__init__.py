@@ -536,7 +536,8 @@ def _canonical_iteration_runs(
     U+3005 repeats only an immediately preceding Han character in the same run.
     Chained marks repeat the resolved Han character; punctuation, whitespace,
     kana, Hangul, and a mark at the start of a run do not supply an antecedent.
-    The anchor set contains the bigrams on either side of each expanded mark.
+    The anchor set contains the bigrams on either side of each expanded mark,
+    including a following non-Han CJK character that distinguishes the run.
     """
     runs: List[tuple[Set[str], Set[str], Set[str]]] = []
     run: List[str] = []
@@ -557,7 +558,6 @@ def _canonical_iteration_runs(
                 for expanded_index in expanded_indexes
                 for index in (expanded_index - 1, expanded_index)
                 if 0 <= index < len(run) - 1
-                and all(_is_canonical_han_char(char) for char in run[index:index + 2])
             }
             runs.append((raw_tokens, tokens, anchors))
         run.clear()

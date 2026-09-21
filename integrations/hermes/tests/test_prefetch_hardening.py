@@ -513,6 +513,31 @@ def test_iteration_mark_canonical_slots_recall_only_the_exact_name(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("query", "expected_name"),
+    [
+        ("佐々あ", "saa"),
+        ("佐佐あ", "saa"),
+        ("佐々い", "sai"),
+        ("佐佐い", "sai"),
+    ],
+)
+def test_iteration_mark_canonical_slots_keep_kana_suffix_discriminator(
+    tmp_path, query, expected_name
+):
+    store = CanonicalStore(db_path=tmp_path / "canonical.db")
+    store.remember("default", "model:user", "saa", "佐々あ")
+    store.remember("default", "model:user", "sai", "佐々い")
+    provider = _provider([])
+    provider._beam.canonical = store
+
+    response = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": query, "limit": 5},
+    ))
+
+    assert [row["canonical_name"] for row in response["results"]] == [expected_name]
+
+
+@pytest.mark.parametrize(
     ("query", "body", "sibling_body"),
     [
         ("佐々木", "佐佐木", "佐佐野"),
