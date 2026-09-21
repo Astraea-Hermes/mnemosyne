@@ -528,7 +528,9 @@ def _canonical_cjk_ngram_size(query: str) -> int:
     return 1 if len(cjk_chars) == 1 and not non_cjk_tokens else 2
 
 
-def _canonical_iteration_runs(content: str) -> List[tuple[Set[str], Set[str]]]:
+def _canonical_iteration_runs(
+    content: str,
+) -> List[tuple[Set[str], Set[str], Set[str]]]:
     """Return normalized CJK-run bigrams and iteration-mark anchor bigrams.
 
     U+3005 repeats only an immediately preceding Han character in the same run.
@@ -536,14 +538,19 @@ def _canonical_iteration_runs(content: str) -> List[tuple[Set[str], Set[str]]]:
     kana, Hangul, and a mark at the start of a run do not supply an antecedent.
     The anchor set contains the bigrams on either side of each expanded mark.
     """
-    runs: List[tuple[Set[str], Set[str]]] = []
+    runs: List[tuple[Set[str], Set[str], Set[str]]] = []
     run: List[str] = []
+    raw_run: List[str] = []
     expanded_indexes: Set[int] = set()
     repeatable_han: Optional[str] = None
 
     def flush_run() -> None:
         nonlocal repeatable_han
         if len(run) >= 2:
+            raw_tokens = {
+                "".join(raw_run[index:index + 2])
+                for index in range(len(raw_run) - 1)
+            }
             tokens = {"".join(run[index:index + 2]) for index in range(len(run) - 1)}
             anchors = {
                 "".join(run[index:index + 2])
@@ -552,22 +559,26 @@ def _canonical_iteration_runs(content: str) -> List[tuple[Set[str], Set[str]]]:
                 if 0 <= index < len(run) - 1
                 and all(_is_canonical_han_char(char) for char in run[index:index + 2])
             }
-            runs.append((tokens, anchors))
+            runs.append((raw_tokens, tokens, anchors))
         run.clear()
+        raw_run.clear()
         expanded_indexes.clear()
         repeatable_han = None
 
     for char in _strip_prefetch_prefix(content).lower():
         if _is_canonical_han_char(char):
+            raw_run.append(char)
             run.append(char)
             repeatable_han = char
         elif char == "\u3005":
+            raw_run.append(char)
             if repeatable_han is not None:
                 run.append(repeatable_han)
                 expanded_indexes.add(len(run) - 1)
             else:
                 run.append(char)
         elif _is_prefetch_cjk_char(char):
+            raw_run.append(char)
             run.append(char)
             repeatable_han = None
         else:
@@ -579,7 +590,7 @@ def _canonical_iteration_runs(content: str) -> List[tuple[Set[str], Set[str]]]:
 def _canonical_explicit_match_tokens(content: str, *, cjk_ngram_size: int) -> Set[str]:
     """Add iteration-normalized evidence only for explicit canonical recall."""
     tokens = _canonical_match_tokens(content, cjk_ngram_size=cjk_ngram_size)
-    for run_tokens, _anchors in _canonical_iteration_runs(content):
+    for _raw_tokens, run_tokens, _anchors in _canonical_iteration_runs(content):
         tokens.update(run_tokens)
     return tokens
 
@@ -588,30 +599,45 @@ def _canonical_iteration_recall_match(query: str, body: str) -> bool:
     """Require all local iteration-mark evidence to match within one CJK run."""
     query_runs = _canonical_iteration_runs(query)
     body_runs = _canonical_iteration_runs(body)
-    query_anchors = [anchors for _tokens, anchors in query_runs if anchors]
+    query_anchors = [anchors for _raw_tokens, _tokens, anchors in query_runs if anchors]
     if query_anchors:
         return all(
-            any(anchors <= body_tokens for body_tokens, _body_anchors in body_runs)
+            any(anchors <= body_tokens for _raw_tokens, body_tokens, _body_anchors in body_runs)
             for anchors in query_anchors
         )
 
-    if "\u3005" in _strip_prefetch_prefix(query) and any(
-        anchors for _tokens, anchors in body_runs
+    query_raw_tokens = (
+        set().union(*(_raw_tokens for _raw_tokens, _tokens, _anchors in query_runs))
+        if query_runs else set()
+    )
+    matching_body_runs = [
+        (raw_tokens, anchors)
+        for raw_tokens, _tokens, anchors in body_runs
+        if raw_tokens & query_raw_tokens
+    ]
+    if "\u3005" in _strip_prefetch_prefix(query) and matching_body_runs and all(
+        anchors for _raw_tokens, anchors in matching_body_runs
     ):
         # A leading or boundary-separated mark has no Han antecedent. Do not
         # let its raw ``々X`` bigram impersonate a valid in-run expansion.
         return False
 
-    query_tokens = set().union(*(tokens for tokens, _anchors in query_runs)) if query_runs else set()
+    query_tokens = (
+        set().union(*(tokens for _raw_tokens, tokens, _anchors in query_runs))
+        if query_runs else set()
+    )
     relevant_body_anchors = [
         anchors
-        for _tokens, anchors in body_runs
+        for _raw_tokens, _tokens, anchors in body_runs
         if anchors and anchors & query_tokens
     ]
     if not relevant_body_anchors:
         return True
     return any(
-        any(anchors <= query_run_tokens for query_run_tokens, _query_anchors in query_runs)
+        any(
+            anchors <= query_run_tokens
+            for _raw_tokens, query_run_tokens, _query_anchors in query_runs
+        )
         for anchors in relevant_body_anchors
     )
 

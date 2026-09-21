@@ -564,6 +564,16 @@ def test_start_of_run_iteration_marks_keep_literal_compatibility():
     ] == ["matching"]
 
 
+def test_start_of_run_literal_match_survives_unrelated_iteration_run():
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": "々木 佐々野", "category": "model:user"},
+    ])
+
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", "々木", limit=5)
+    ] == ["matching"]
+
+
 @pytest.mark.parametrize(
     ("query", "body"),
     [
