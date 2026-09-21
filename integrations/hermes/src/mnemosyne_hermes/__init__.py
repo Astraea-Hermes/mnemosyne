@@ -454,6 +454,11 @@ def _is_prefetch_cjk_char(char: str) -> bool:
     )
 
 
+def _is_canonical_han_char(char: str) -> bool:
+    """Return whether ``char`` can be repeated by the ideographic iteration mark."""
+    return "\u4e00" <= char <= "\u9fff"
+
+
 def _prefetch_tokens(content: str) -> Set[str]:
     c = _strip_prefetch_prefix(content).lower()
     # Core recall scores spaceless CJK text by character overlap. Preserve that
@@ -523,10 +528,98 @@ def _canonical_cjk_ngram_size(query: str) -> int:
     return 1 if len(cjk_chars) == 1 and not non_cjk_tokens else 2
 
 
+def _canonical_iteration_runs(content: str) -> List[tuple[Set[str], Set[str]]]:
+    """Return normalized CJK-run bigrams and iteration-mark anchor bigrams.
+
+    U+3005 repeats only an immediately preceding Han character in the same run.
+    Chained marks repeat the resolved Han character; punctuation, whitespace,
+    kana, Hangul, and a mark at the start of a run do not supply an antecedent.
+    The anchor set contains the bigrams on either side of each expanded mark.
+    """
+    runs: List[tuple[Set[str], Set[str]]] = []
+    run: List[str] = []
+    expanded_indexes: Set[int] = set()
+    repeatable_han: Optional[str] = None
+
+    def flush_run() -> None:
+        nonlocal repeatable_han
+        if len(run) >= 2:
+            tokens = {"".join(run[index:index + 2]) for index in range(len(run) - 1)}
+            anchors = {
+                "".join(run[index:index + 2])
+                for expanded_index in expanded_indexes
+                for index in (expanded_index - 1, expanded_index)
+                if 0 <= index < len(run) - 1
+                and all(_is_canonical_han_char(char) for char in run[index:index + 2])
+            }
+            runs.append((tokens, anchors))
+        run.clear()
+        expanded_indexes.clear()
+        repeatable_han = None
+
+    for char in _strip_prefetch_prefix(content).lower():
+        if _is_canonical_han_char(char):
+            run.append(char)
+            repeatable_han = char
+        elif char == "\u3005":
+            if repeatable_han is not None:
+                run.append(repeatable_han)
+                expanded_indexes.add(len(run) - 1)
+            else:
+                run.append(char)
+        elif _is_prefetch_cjk_char(char):
+            run.append(char)
+            repeatable_han = None
+        else:
+            flush_run()
+    flush_run()
+    return runs
+
+
+def _canonical_explicit_match_tokens(content: str, *, cjk_ngram_size: int) -> Set[str]:
+    """Add iteration-normalized evidence only for explicit canonical recall."""
+    tokens = _canonical_match_tokens(content, cjk_ngram_size=cjk_ngram_size)
+    for run_tokens, _anchors in _canonical_iteration_runs(content):
+        tokens.update(run_tokens)
+    return tokens
+
+
+def _canonical_iteration_recall_match(query: str, body: str) -> bool:
+    """Require all local iteration-mark evidence to match within one CJK run."""
+    query_runs = _canonical_iteration_runs(query)
+    body_runs = _canonical_iteration_runs(body)
+    query_anchors = [anchors for _tokens, anchors in query_runs if anchors]
+    if query_anchors:
+        return all(
+            any(anchors <= body_tokens for body_tokens, _body_anchors in body_runs)
+            for anchors in query_anchors
+        )
+
+    if "\u3005" in _strip_prefetch_prefix(query) and any(
+        anchors for _tokens, anchors in body_runs
+    ):
+        # A leading or boundary-separated mark has no Han antecedent. Do not
+        # let its raw ``々X`` bigram impersonate a valid in-run expansion.
+        return False
+
+    query_tokens = set().union(*(tokens for tokens, _anchors in query_runs)) if query_runs else set()
+    relevant_body_anchors = [
+        anchors
+        for _tokens, anchors in body_runs
+        if anchors and anchors & query_tokens
+    ]
+    if not relevant_body_anchors:
+        return True
+    return any(
+        any(anchors <= query_run_tokens for query_run_tokens, _query_anchors in query_runs)
+        for anchors in relevant_body_anchors
+    )
+
+
 def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
     """Return canonical facts using the established explicit-recall contract."""
     cjk_ngram_size = _canonical_cjk_ngram_size(query)
-    query_tokens = _canonical_match_tokens(query, cjk_ngram_size=cjk_ngram_size)
+    query_tokens = _canonical_explicit_match_tokens(query, cjk_ngram_size=cjk_ngram_size)
     if not query_tokens:
         return []
     try:
@@ -539,10 +632,12 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
         body = str(row.get("body") or "").strip()
         if not body:
             continue
-        row_tokens = _canonical_match_tokens(body, cjk_ngram_size=cjk_ngram_size)
+        row_tokens = _canonical_explicit_match_tokens(body, cjk_ngram_size=cjk_ngram_size)
         overlap = query_tokens & row_tokens
         distinctive_overlap = overlap - generic_tokens
         if not distinctive_overlap:
+            continue
+        if not _canonical_iteration_recall_match(query, body):
             continue
         coverage = len(overlap) / max(len(query_tokens), 1)
         distinctive_coverage = len(distinctive_overlap) / max(len(query_tokens - generic_tokens), 1)

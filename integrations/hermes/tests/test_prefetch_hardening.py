@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from mnemosyne.core.canonical import CanonicalStore
 
 from mnemosyne_hermes import (
     MnemosyneMemoryProvider,
@@ -485,6 +486,82 @@ def test_canonical_matching_keeps_japanese_iteration_mark_in_cjk_run():
     assert [
         row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", "佐々木")
     ] == ["japanese-name"]
+
+
+def test_iteration_mark_canonical_slots_recall_only_the_exact_name(tmp_path):
+    store = CanonicalStore(db_path=tmp_path / "canonical.db")
+    store.remember("default", "model:user", "sasaki", "佐々木")
+    store.remember("default", "model:user", "sasano", "佐々野")
+    provider = _provider([])
+    provider._beam.canonical = store
+
+    sasaki = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": "佐々木", "limit": 5},
+    ))
+    sasano = json.loads(provider.handle_tool_call(
+        "mnemosyne_recall", {"query": "佐々野", "limit": 5},
+    ))
+
+    assert [row["canonical_name"] for row in sasaki["results"]] == ["sasaki"]
+    assert [row["canonical_name"] for row in sasano["results"]] == ["sasano"]
+    assert [
+        row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", "佐々木")
+    ] == ["sasaki"]
+    assert [
+        row["canonical_name"] for row in _canonical_prefetch_rows(store, "default", "佐々野")
+    ] == ["sasano"]
+
+
+@pytest.mark.parametrize(
+    ("query", "body", "sibling_body"),
+    [
+        ("佐々木", "佐佐木", "佐佐野"),
+        ("佐佐木", "佐々木", "佐々野"),
+        ("佐々々木", "佐佐佐木", "佐佐佐野"),
+        ("人々", "人人", "人海"),
+        ("ID-佐々木-A", "ID-佐佐木-A", "ID-佐佐野-A"),
+    ],
+)
+def test_explicit_recall_treats_iteration_marks_as_literal_han_repetition(
+    query, body, sibling_body
+):
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": body, "category": "model:user"},
+        {"name": "sibling", "body": sibling_body, "category": "model:user"},
+    ])
+
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", query, limit=5)
+    ] == ["matching"]
+
+
+@pytest.mark.parametrize(
+    ("query", "body"),
+    [
+        ("々木", "佐々木"),
+        ("佐 々木", "佐々木"),
+        ("佐、々木", "佐々木"),
+        ("佐々木", "佐 々木"),
+        ("の々木", "のの木"),
+    ],
+)
+def test_explicit_recall_does_not_expand_iteration_marks_across_boundaries(query, body):
+    store = FakeCanonicalStore([
+        {"name": "non-matching", "body": body, "category": "model:user"},
+    ])
+
+    assert _canonical_recall_rows(store, "default", query, limit=5) == []
+
+
+def test_start_of_run_iteration_marks_keep_literal_compatibility():
+    store = FakeCanonicalStore([
+        {"name": "matching", "body": "々木", "category": "model:user"},
+        {"name": "sibling", "body": "々野", "category": "model:user"},
+    ])
+
+    assert [
+        row["canonical_name"] for row in _canonical_recall_rows(store, "default", "々木", limit=5)
+    ] == ["matching"]
 
 
 @pytest.mark.parametrize(
