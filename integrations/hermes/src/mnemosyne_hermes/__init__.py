@@ -1020,6 +1020,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
+    _INVALID_SYNC_ROLES_WARNING = (
+        "Mnemosyne: invalid sync_roles configuration; expected a comma-separated "
+        "string or a list, tuple, or set containing valid roles (user, assistant). "
+        "Conversation autosave remains disabled."
+    )
     _WRITE_POLICY_TOOL_NAMES: frozenset = frozenset({
         "mnemosyne_apply_pending",
         "mnemosyne_batch",
@@ -1128,10 +1133,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # overrides, so membership (not truthiness) controls precedence.
         self._write_policy_overrides: Dict[str, Any] = {}
         self._sync_roles: Set[str] = {"user"}
-        _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
-        if _sync_env is not None:
-            _parsed_roles = {r.strip().lower() for r in _sync_env.split(",") if r.strip()}
-            self._sync_roles = _parsed_roles & self._VALID_SYNC_ROLES
         self._skip_contexts = {"cron", "flush", "subagent", "background", "skill_loop"}  # Agent contexts to skip
         # Allow override via MNEMOSYNE_SKIP_CONTEXTS env var.
         # Set to empty string to skip nothing (enable all contexts).
@@ -1383,6 +1384,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception:
             return False
 
+    @classmethod
+    def _parse_sync_roles(cls, raw: Any) -> tuple[set[str], bool]:
+        """Return allowed roles and whether a nonempty value is invalid."""
+        if isinstance(raw, str):
+            parsed = {role.strip().lower() for role in raw.split(",") if role.strip()}
+            explicitly_empty = raw == ""
+        elif isinstance(raw, (list, tuple, set)):
+            parsed = {str(role).strip().lower() for role in raw if str(role).strip()}
+            explicitly_empty = len(raw) == 0
+        else:
+            parsed = set()
+            explicitly_empty = False
+
+        roles = parsed & cls._VALID_SYNC_ROLES
+        return roles, not roles and not explicitly_empty
+
     def _apply_provider_config(self, kwargs: Dict[str, Any]) -> None:
         """Apply provider-specific config from Hermes kwargs or config.yaml.
 
@@ -1474,14 +1491,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         _sync_raw = kwargs.get("sync_roles")
         if _sync_raw is None:
             _sync_raw = self._read_config_key("sync_roles")
-        if _sync_raw is not None:
-            if isinstance(_sync_raw, str):
-                parsed = {r.strip().lower() for r in _sync_raw.split(",") if r.strip()}
-            elif isinstance(_sync_raw, (list, tuple, set)):
-                parsed = {str(r).strip().lower() for r in _sync_raw if str(r).strip()}
-            else:
-                parsed = set()
-            self._sync_roles = parsed & self._VALID_SYNC_ROLES
+        if _sync_raw is None:
+            _sync_raw = os.environ.get("MNEMOSYNE_SYNC_ROLES", "user")
+        self._sync_roles, invalid_sync_roles = self._parse_sync_roles(_sync_raw)
+        if invalid_sync_roles:
+            logger.warning(self._INVALID_SYNC_ROLES_WARNING)
 
         # skip_contexts: kwargs > config.yaml > env var (already set in __init__)
         _skip_raw = kwargs.get("skip_contexts")
