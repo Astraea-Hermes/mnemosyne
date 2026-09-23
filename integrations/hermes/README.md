@@ -249,6 +249,7 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_SYNC_TURN_ASSISTANT_LIMIT` | `800` | Assistant content truncation in `sync_turn()` (`0` = no limit) |
 | `MNEMOSYNE_FACT_RECALL_ENABLED` | `false` | Merge LLM-extracted facts into standard recall |
 | `MNEMOSYNE_IGNORE_PATTERNS` | _(empty)_ | Newline-separated regular expressions; matching writes are rejected before persistence |
+| `MNEMOSYNE_SYNC_ROLES` | `user` | Comma-separated roles autosaved by `sync_turn()` (`user`, `assistant`; empty disables conversation autosave) |
 | `MNEMOSYNE_WRITE_CLASSIFIER` | `off` | Write admission classifier: `off`, `warn`, or `strict` |
 | `MNEMOSYNE_PREFETCH_CONTENT_CHARS` | `0` | Per-memory prefetch content cap (`0` = full content) |
 | `MNEMOSYNE_PREFETCH_MIN_DISTINCTIVE_TOKENS` | `2` | Shared non-generic terms required for automatic prefetch injection |
@@ -266,10 +267,21 @@ memory:
   mnemosyne:
     auto_sleep: true
     sleep_threshold: 30
+    sync_roles: [user]  # user | assistant; [] disables conversation autosave
     ignore_patterns:
       - "^\\s*\\$\\s*pip\\s"
     write_classifier: "off"  # off | warn | strict
 ```
+
+`sync_roles` accepts a comma-separated string (for example, `user,assistant`) or
+an `initialize(...)`/YAML list, tuple, or set containing `user` and/or
+`assistant`. A string that looks like a YAML list, such as `"['user',
+'assistant']"`, is not parsed as YAML; it is invalid. Empty strings and empty
+containers silently disable conversation autosave. A non-empty value containing
+no valid roles disables autosave and logs one warning; unknown entries are
+silently dropped when at least one valid role remains. Resolution precedence is
+`initialize(...)` keyword argument > Hermes `memory.mnemosyne.sync_roles` >
+Mnemosyne `sync_roles` config > `MNEMOSYNE_SYNC_ROLES` > default `user`.
 
 For `ignore_patterns` and `write_classifier`, an explicit `initialize(...)`
 keyword argument takes precedence. Without that override, resolution is
