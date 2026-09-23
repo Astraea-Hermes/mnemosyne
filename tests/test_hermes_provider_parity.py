@@ -447,7 +447,21 @@ def test_provider_config_defaults_match(provider_modules):
     root_config = _config_schema(provider_modules["hermes_memory_provider"])
     integration_config = _config_schema(provider_modules["mnemosyne_hermes"])
 
-    assert _json_stable(root_config) == _json_stable(integration_config)
+    root_sync_roles = root_config["sync_roles"].copy()
+    integration_sync_roles = integration_config["sync_roles"].copy()
+    sync_roles_description = integration_sync_roles.pop("description")
+    root_sync_roles.pop("description")
+    root_without_sync_roles = root_config.copy()
+    integration_without_sync_roles = integration_config.copy()
+    root_without_sync_roles.pop("sync_roles")
+    integration_without_sync_roles.pop("sync_roles")
+
+    assert _json_stable(root_without_sync_roles) == _json_stable(integration_without_sync_roles)
+    assert _json_stable(root_sync_roles) == _json_stable(integration_sync_roles)
+    assert "stringified YAML/JSON lists are not parsed" in sync_roles_description
+    assert "no valid roles disable it and log one warning" in sync_roles_description
+    assert "initialize() kwarg > Hermes memory.mnemosyne config" in sync_roles_description
+
     assert root_config["auto_sleep"]["default"] is True
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
