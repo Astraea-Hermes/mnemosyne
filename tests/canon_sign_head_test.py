@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Scales acceptance criterion — canon-sign chain head resolution. v3.
+"""Scales acceptance criterion — canon-sign chain head resolution. v5.
 Rides the re-host PR: runs GREEN only after keeper's (a) _handle_invalidate
 surface branch + (b) declared-edge replay land on the senses probe-chain-green build.
 
 v2->v3: why's receipt-or-fail clause applied to this gate by its own author —
 every arm emits a positive per-arm receipt (population checked + outcome);
 an arm that could not run is VACUOUS->RED, never silently green.
+
+v4->v5 (scales ruling 2026-09-24, on keeper's replay landing FAIL(1) red=[A3]):
+A3's accepted out-edge vocabulary gains the third typed form,
+`metadata.supplements`. This was NOT goalpost-moving to win: (i) A5 already
+enumerates supplements as a typed edge — A3 denying it was an internal
+contradiction of this file; (ii) A3's intent is "open non-head row carries a
+typed out-edge" and the live supplement's edge (validated for target by A6b)
+IS a typed out-edge; (iii) the alternative — stamp-closing sf_18287cec —
+would flip the store PASS by contradicting the row's own recorded
+supersedes_nothing stance: changing the world to fit the measure. Only the
+form A6b already target-checks is admitted here; detection holes unchanged
+(prose-only supplements still RED via A6a; dangling still RED via A5).
 
 Design laws (rulings this encodes):
   - CHAIN membership: TRANSITIONAL anchor startswith (prose, labeled-for-
@@ -83,11 +95,14 @@ emit("A2", len(heads) == 1,
      f"open heads={len(heads)} {[r['id'] for r in heads]} (target: exactly 1)")
 
 # A3 every open non-head chain/supp row has a typed out-edge
+# (v5: out-edge vocabulary = superseded_by | metadata.supersedes |
+# metadata.supplements — the same three forms A5 enumerates store-wide)
 nonhead_open = [r for r in chain + supps if open_(r) and r not in heads]
 bad3 = [r["id"] for r in nonhead_open
-        if not (r["superseded_by"] or meta(r, "supersedes"))]
+        if not (r["superseded_by"] or meta(r, "supersedes") or meta(r, "supplements"))]
 emit("A3", not bad3,
-     f"{len(nonhead_open)} open non-head rows checked for typed out-edge; prose-only: {bad3}",
+     f"{len(nonhead_open)} open non-head rows checked for typed out-edge "
+     f"(vocab: superseded_by|supersedes|supplements, per A5 parity); prose-only: {bad3}",
      ran=bool(nonhead_open))
 
 # A4 validity-stamped chain rows must also carry typed superseded_by
