@@ -23,6 +23,7 @@ import math
 import os
 import re
 import threading
+import contextvars
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -741,12 +742,22 @@ def _canonical_recall_rows(store: Any, owner_id: str, query: str, *, limit: int 
             "tier": "canonical",
             "canonical_category": row.get("category"),
             "canonical_name": row.get("name"),
+            "canonical_owner": row.get("owner_id"),
         })
     candidates.sort(
         key=lambda r: (float(r.get("score") or 0.0), float(r.get("keyword_score") or 0.0)),
         reverse=True,
     )
     return candidates[:limit]
+
+
+def _p1b_home_key(home: Any = None) -> str:
+    """Home key for call-time binding resolution (P1b, 2026-09-20 incident)."""
+    try:
+        from hermes_constants import get_hermes_home, hermes_home_key
+        return hermes_home_key(home or get_hermes_home())
+    except Exception:
+        return "default"
 
 
 def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
@@ -832,6 +843,7 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
             "tier": "canonical",
             "canonical_category": row.get("category"),
             "canonical_name": row.get("name"),
+            "canonical_owner": row.get("owner_id"),
             "_prefetch_overlap_count": len(distinctive_overlap),
         })
     # When one fact has materially stronger lexical evidence, do not let
@@ -1093,7 +1105,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # time to try again; None means nothing to retry.
         self._retry_init_args: Optional[tuple] = None
         self._retry_init_at: float = 0.0
-        self._session_id = "hermes_default"
+        # P1b (2026-09-20 incident): ambient attributes replaced by a home-keyed
+        # bindings dict resolved AT CALL TIME from the turn's scope, with the
+        # last-initialized binding as out-of-turn fallback (cron/teardown keep
+        # legacy behavior exactly). _beam/_agent_identity/_session_id are
+        # properties over these slots; see _binding_slot below.
+        self._bindings: Dict[str, Dict[str, Any]] = {
+            "default": {"beam": None, "agent_identity": "", "session_id": "hermes_default"},
+        }
+        self._ambient_key = "default"
+        self._init_key: Optional[str] = None
         self._hermes_home = ""
         self._platform = "cli"
         self._agent_context = "primary"
@@ -1909,6 +1930,44 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         return "default"
 
+    # ---- P1b call-time binding properties (2026-09-20 multiplex incident) ----
+    def _binding_slot(self) -> Dict[str, Any]:
+        bindings = self.__dict__.setdefault("_bindings", {})
+        ambient = self.__dict__.setdefault("_ambient_key", "default")
+        slot = bindings.get(_p1b_home_key()) or bindings.get(ambient)
+        if slot is None:
+            slot = bindings.setdefault(ambient, {"beam": None, "agent_identity": "", "session_id": "hermes_default"})
+        return slot
+
+    def _write_slot(self) -> Dict[str, Any]:
+        bindings = self.__dict__.setdefault("_bindings", {})
+        key = self.__dict__.get("_init_key") or self.__dict__.setdefault("_ambient_key", "default")
+        return bindings.setdefault(key, {"beam": None, "agent_identity": "", "session_id": "hermes_default"})
+
+    @property
+    def _beam(self):
+        return self._binding_slot()["beam"]
+
+    @_beam.setter
+    def _beam(self, value):
+        self._write_slot()["beam"] = value
+
+    @property
+    def _agent_identity(self):
+        return self._binding_slot()["agent_identity"]
+
+    @_agent_identity.setter
+    def _agent_identity(self, value):
+        self._write_slot()["agent_identity"] = value
+
+    @property
+    def _session_id(self):
+        return self._binding_slot()["session_id"]
+
+    @_session_id.setter
+    def _session_id(self, value):
+        self._write_slot()["session_id"] = value
+
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
         with self._ensure_beam_access_lock():
@@ -1940,6 +1999,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Mnemosyne: could not close prior audit log", exc_info=True)
         self._memory = None
         self._audit = None
+        # Route every binding write below to THIS agent's home slot (kwargs are
+        # per-agent correct even when construction runs outside turn scope).
+        self._init_key = _p1b_home_key(kwargs.get("hermes_home") or None)
         self._beam = None
         self._init_error = None
         self._unavailable_reason_code = "never_initialized"
@@ -2050,6 +2112,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 self._memory = mem
                 self._beam = mem.beam
+                self._ambient_key = self._init_key
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
                     self._session_id, bank_name, mem.db_path,
@@ -2065,6 +2128,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if kwargs.get("channel_id"):
                     beam_kwargs["channel_id"] = kwargs["channel_id"]
                 self._beam = BeamMemory(**beam_kwargs)
+                self._ambient_key = self._init_key
                 logger.info(
                     "Mnemosyne initialized: session=%s, db=%s",
                     self._session_id, db_path or "default",
@@ -2290,7 +2354,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 trust_tag = f" [{trust}]" if trust != "STATED" else ""
                 source = str(r.get("source") or "").strip()
                 source_tag = f", source {source}" if source and source != "conversation" else ""
-                lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag} {content}")
+                prov = ""
+                if trust == "CANONICAL":
+                    # Self-attesting inject (2026-09-20 incident): canonical lines
+                    # must name whose fact they are and WHICH HOME the read came
+                    # from — contamination is otherwise undetectable by the victim.
+                    _home = str(getattr(self._beam, "db_path", "") or "?")
+                    prov = f" [owner={r.get('canonical_owner') or '?'} home={_home}]"
+                lines.append(f"  [{ts}] (importance {imp:.2f}{source_tag}){trust_tag}{prov} {content}")
             return "\n".join(lines)
         except Exception as e:
             logger.debug("Mnemosyne prefetch failed: %s", e)
@@ -2702,7 +2773,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     except Exception as inner:
                         logger.debug("Mnemosyne auto-sleep worker failed: %s", inner)
 
-                sleep_thread = threading.Thread(target=_sleep_isolated, daemon=True)
+                # P1b: run the worker in the caller's copied context (in-turn spawn)
+                # so out-of-turn ambient fallback never misbinds capture writes.
+                sleep_thread = threading.Thread(
+                    target=contextvars.copy_context().run, args=(_sleep_isolated,), daemon=True)
                 sleep_thread.start()
                 sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
                 if sleep_thread.is_alive():
@@ -2739,6 +2813,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         else nullcontext()
                     )
                 with policy_context:
+                    # Fail-closed canonical WRITE guard (2026-09-20 incident): a
+                    # session may restamp self-facts only through an instance
+                    # bound to its own profile. Reads are intentionally not
+                    # gated; mismatch here means a keying regression and must
+                    # surface as a loud error, never a silent reroute.
+                    if tool_name in ("mnemosyne_remember_canonical", "mnemosyne_forget_canonical"):
+                        _guard_err = self._canonical_write_guard(tool_name)
+                        if _guard_err is not None:
+                            return _guard_err
                     # Tools use the durable session selected by on_session_switch().
                     # Hold the same session lock for the complete dispatch so a write,
                     # recall, or sleep cannot be re-attributed mid-operation.
@@ -3233,7 +3316,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         surface_content = self._surface_label(content, kind)
         stable_id = "sf_" + self._surface_hash(surface_content)
         meta = dict(metadata)
-        meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool", "source_profile_session": self._session_id})
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            from hermes_constants import get_hermes_home
+            _wp = (get_active_profile_name() or "")
+            _wh = str(get_hermes_home())
+        except Exception:
+            _wp, _wh = "", ""
+        meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool",
+                     "source_profile_session": self._session_id,
+                     "writer_profile": _wp, "writer_home": _wh})
         existing_id = self._surface_beam._find_duplicate(surface_content)
         memory_id = self._surface_beam.remember(
             content=surface_content,
@@ -3614,6 +3706,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                 as_of=as_of, db_path=self._beam.db_path)
         return json.dumps({"count": len(results), "results": results})
 
+    def _canonical_write_guard(self, tool_name: str) -> Optional[str]:
+        """Structured error when this turn's profile does not own the bound
+        canonical identity; None when the write may proceed."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            turn = (get_active_profile_name() or "").strip()
+        except Exception:
+            turn = ""
+        bound = (self._canonical_owner() or "").strip()
+        if turn and bound and turn != bound:
+            return json.dumps({
+                "status": "canonical_owner_mismatch",
+                "error": "canonical_owner_mismatch",
+                "tool": tool_name,
+                "bound_owner": bound,
+                "active_profile": turn,
+                "hint": "provider instance bound to another profile — per-home "
+                        "keying regression; do not retry, report to the room.",
+            })
+        return None
+
     def _canonical_owner(self) -> str:
         """Owner id for canonical reads/writes: the active Hermes profile.
 
@@ -3642,9 +3755,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             from mnemosyne.core.canonical import CanonicalStore
             store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
             self._beam.canonical = store
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            from hermes_constants import get_hermes_home
+            _wid, _whome = (get_active_profile_name() or ""), str(get_hermes_home())
+        except Exception:
+            _wid, _whome = "", ""
         row = store.remember(
             owner_id, category, name, body,
             source=source, confidence=confidence,
+            writer_id=_wid, writer_home=_whome,
         )
         if row is None:
             return json.dumps({"status": "filtered", "store": "canonical"})
@@ -4484,7 +4604,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 except Exception as inner:
                     logger.debug("Mnemosyne session-end sleep failed: %s", inner)
 
-            sleep_thread = threading.Thread(target=_sleep_with_logging, daemon=True)
+            sleep_thread = threading.Thread(
+                target=contextvars.copy_context().run, args=(_sleep_with_logging,), daemon=True)
             self._session_end_thread = sleep_thread
             sleep_thread.start()
             sleep_thread.join(timeout=timeout)
