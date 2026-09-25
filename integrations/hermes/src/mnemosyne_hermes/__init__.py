@@ -2775,8 +2775,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
                 # P1b: run the worker in the caller's copied context (in-turn spawn)
                 # so out-of-turn ambient fallback never misbinds capture writes.
-                sleep_thread = threading.Thread(
-                    target=contextvars.copy_context().run, args=(_sleep_isolated,), daemon=True)
+                # The target stays a zero-argument callable: host code and the
+                # parity contract both fake Thread with target() invocations.
+                _sleep_ctx = contextvars.copy_context()
+
+                def _sleep_worker():
+                    _sleep_ctx.run(_sleep_isolated)
+
+                sleep_thread = threading.Thread(target=_sleep_worker, daemon=True)
                 sleep_thread.start()
                 sleep_thread.join(timeout=self._AUTO_SLEEP_TIMEOUT_SECONDS)
                 if sleep_thread.is_alive():
