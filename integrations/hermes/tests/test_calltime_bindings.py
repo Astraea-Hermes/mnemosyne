@@ -39,7 +39,13 @@ def _fake_home_keying(monkeypatch):
             return str(home)
         return str(_HOME.get() or "default")
 
+    def fake_current_key():
+        # Mirrors _p1b_current_key: None means out-of-turn (ambient answers).
+        home = _HOME.get()
+        return None if home is None else str(home)
+
     monkeypatch.setattr(mnemosyne_hermes, "_p1b_home_key", fake_home_key)
+    monkeypatch.setattr(mnemosyne_hermes, "_p1b_current_key", fake_current_key)
     _HOME.set(None)
 
 
@@ -97,15 +103,47 @@ def test_last_initialized_home_does_not_win_at_call_time(tmp_path, monkeypatch):
     assert p._beam is beam_b
 
 
-def test_unknown_home_at_call_time_falls_back_to_ambient(tmp_path, monkeypatch):
-    # Out-of-turn callers (cron/teardown) keep last-init behavior: no binding
-    # for the ambient home means the ambient slot answers, never None.
+def test_unknown_home_in_turn_fails_closed(tmp_path, monkeypatch):
+    # #1050 review point 1: an in-turn call from a home that never
+    # initialized must NOT fall back to another home's binding.
     monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _RecordingBeam)
     p = MnemosyneMemoryProvider()
     _HOME.set("home-a")
     p.initialize("sess-a", hermes_home="home-a")
     beam_a = p._beam
+    assert beam_a is not None
+
     _HOME.set("never-initialized-home")
+    # Reads resolve to an empty slot, never another home's beam.
+    assert p._beam is not beam_a and p._beam is None
+    assert p._session_id is None and p._agent_identity == ""
+    # A read degrades to the existing unavailable surface, it does not raise.
+    assert p.prefetch("anything", session_id="sess-x") == ""
+    # A write fails closed instead of persisting into home-a's store.
+    out = json.loads(p.handle_tool_call("mnemosyne_remember", {"content": "x"}))
+    assert out.get("status") == "memory_unavailable", (
+        f"unknown-home write did not fail closed: {out}"
+    )
+    assert out.get("reason_code") == "never_initialized"
+    # The refused write created no binding for the unknown home and did not
+    # reroute: home-a's slot still holds exactly its own beam.
+    assert "never-initialized-home" not in p.__dict__["_bindings"]
+    holders = [k for k, b in p.__dict__["_bindings"].items() if b.get("beam") is not None]
+    assert holders == ["home-a"], holders
+    assert p.__dict__["_bindings"]["home-a"]["beam"] is beam_a
+    _HOME.set("home-a")
+    assert p._beam is beam_a
+
+
+def test_out_of_turn_still_uses_ambient_binding(tmp_path, monkeypatch):
+    # Ambient fallback is reserved for genuinely out-of-turn callers
+    # (cron/teardown/workers): with no turn home, the ambient slot answers.
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _RecordingBeam)
+    p = MnemosyneMemoryProvider()
+    _HOME.set("home-a")
+    p.initialize("sess-a", hermes_home="home-a")
+    beam_a = p._beam
+    _HOME.set(None)
     assert p._beam is beam_a
 
 

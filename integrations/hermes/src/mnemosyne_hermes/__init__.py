@@ -760,6 +760,27 @@ def _p1b_home_key(home: Any = None) -> str:
         return "default"
 
 
+def _p1b_current_key() -> Optional[str]:
+    """Raw per-turn home key, or None when this call is out-of-turn.
+
+    Unlike _p1b_home_key this never defaults: None means the caller has no
+    turn scope (cron, teardown, worker threads) and resolves to the ambient
+    binding; a key means this turn belongs to a specific home, whose binding
+    must exist or the call fails closed (review on #1050, point 1).
+    """
+    try:
+        from hermes_constants import get_hermes_home, hermes_home_key
+        home = get_hermes_home()
+    except Exception:
+        return None
+    return None if home is None else hermes_home_key(home)
+
+
+_EMPTY_BINDING: Dict[str, Any] = {
+    "beam": None, "agent_identity": "", "session_id": None,
+}
+
+
 def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: int = 3) -> List[Dict[str, Any]]:
     """Return canonical facts relevant enough for automatic memory-context injection.
 
@@ -1119,7 +1140,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "default": {"beam": None, "agent_identity": "", "session_id": "hermes_default"},
         }
         self._ambient_key = "default"
-        self._init_key: Optional[str] = None
+        # Raw home string of the home currently being initialized, or None.
+        # Routes binding writes to the home under construction even when no
+        # turn scope exists; cleared in the finally of _initialize_locked so
+        # it can never outlive the init that set it.
+        self.__dict__["_init_home"]: Optional[str] = None
         self._hermes_home = ""
         self._platform = "cli"
         self._agent_context = "primary"
@@ -1374,6 +1399,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return
             if time.monotonic() < self._retry_init_at:
                 return
+            turn_key = _p1b_current_key()
+            if (
+                turn_key is not None
+                and self.__dict__.setdefault("_bindings", {}).get(turn_key) is None
+            ):
+                # An in-turn call from an uninitialized home must not consume
+                # another home's stashed retry: that would initialize the
+                # ambient home and hand its beam to this turn (#1050 review).
+                return
             session_id, kwargs = self._retry_init_args
             logger.info(
                 "Mnemosyne retrying init after transient failure: %s", self._init_error
@@ -1396,6 +1430,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if (self._agent_context or "").strip() in self._skip_contexts:
             return
         if self._init_error is not None:
+            return
+        turn_key = _p1b_current_key()
+        if (
+            turn_key is not None
+            and self.__dict__.setdefault("_bindings", {}).get(turn_key) is None
+        ):
+            # Lazy init binds to _hermes_home/env — the LAST initialized
+            # home — not this turn's home. For an in-turn call from an
+            # uninitialized home that would be a misbind; fail closed
+            # instead (the tool call answers memory_unavailable).
+            # (#1050 review, point 1.)
             return
         self.initialize(
             self._session_id or "hermes_default",
@@ -1945,17 +1990,53 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return "default"
 
     # ---- P1b call-time binding properties (2026-09-20 multiplex incident) ----
-    def _binding_slot(self) -> Dict[str, Any]:
+    def _resolve_read_slot(self) -> Dict[str, Any]:
         bindings = self.__dict__.setdefault("_bindings", {})
         ambient = self.__dict__.setdefault("_ambient_key", "default")
-        slot = bindings.get(_p1b_home_key()) or bindings.get(ambient)
-        if slot is None:
-            slot = bindings.setdefault(ambient, {"beam": None, "agent_identity": "", "session_id": "hermes_default"})
-        return slot
+        turn_key = _p1b_current_key()
+        if turn_key is None:
+            # Out-of-turn (cron/teardown/workers): the ambient binding answers.
+            return bindings.setdefault(
+                ambient, {"beam": None, "agent_identity": "", "session_id": "hermes_default"}
+            )
+        slot = bindings.get(turn_key)
+        if slot is not None:
+            return slot
+        # In-turn for a home that never initialized: read as empty, never as
+        # another home's binding. The empty slot makes every entry point take
+        # its existing beam-is-None path (memory_unavailable tool responses,
+        # empty prefetch) instead of misrouting or raising inside read-only
+        # helpers like _audit_event, which document that they never raise.
+        return dict(_EMPTY_BINDING)
+
+    def _binding_slot(self) -> Dict[str, Any]:
+        return self._resolve_read_slot()
 
     def _write_slot(self) -> Dict[str, Any]:
         bindings = self.__dict__.setdefault("_bindings", {})
-        key = self.__dict__.get("_init_key") or self.__dict__.setdefault("_ambient_key", "default")
+        init_home = self.__dict__.get("_init_home")
+        if init_home is not None:
+            # An active initialize() is authoritative for its own home, turn
+            # scope or not; ambient mirroring in _initialize_locked keeps the
+            # paired reads on this same slot (review on #1050, point 2).
+            key = _p1b_home_key(init_home)
+        else:
+            ambient = self.__dict__.setdefault("_ambient_key", "default")
+            turn_key = _p1b_current_key()
+            if turn_key is None:
+                key = ambient
+            elif turn_key in bindings:
+                key = turn_key
+            else:
+                # Fail closed: a write from an uninitialized in-turn home
+                # must never land in another home's store (#1050 review,
+                # point 1). Raise instead — handle_tool_call converts this
+                # to a loud structured error.
+                raise RuntimeError(
+                    f"Mnemosyne: no binding for the current home {turn_key!r}; "
+                    "refusing to write through another home's binding. This "
+                    "session's provider was never initialized for this home."
+                )
         return bindings.setdefault(key, {"beam": None, "agent_identity": "", "session_id": "hermes_default"})
 
     @property
@@ -1986,7 +2067,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Initialize Mnemosyne beam for this session."""
         with self._ensure_beam_access_lock():
             with self._ensure_surface_adapter_lock():
-                self._initialize_locked(session_id, **kwargs)
+                try:
+                    self._initialize_locked(session_id, **kwargs)
+                finally:
+                    # The init routing key is scoped to this init only: an
+                    # A→B→A session switch must never keep steering writes
+                    # into B's slot after B finished initializing
+                    # (#1050 review point 2, `_init_key` residue probe).
+                    self.__dict__["_init_home"] = None
 
     def _initialize_locked(self, session_id: str, **kwargs) -> None:
         """Rebuild provider state while the Beam access lock is held."""
@@ -2015,7 +2103,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._audit = None
         # Route every binding write below to THIS agent's home slot (kwargs are
         # per-agent correct even when construction runs outside turn scope).
-        self._init_key = _p1b_home_key(kwargs.get("hermes_home") or None)
+        init_home = kwargs.get("hermes_home") or None
+        self.__dict__["_init_home"] = init_home
+        init_key = _p1b_home_key(init_home)
+        # Align reads with these writes from the first line: mirror the home
+        # under construction into the ambient key so paired getters resolve to
+        # the same slot the setters target (instead of inheriting the previous
+        # home's identity mid-init, #1050 review point 2). On failure the
+        # half-built slot reads as beam=None, which every entry point already
+        # handles — no silent reroute either way.
+        self.__dict__["_ambient_key"] = init_key
         self._beam = None
         self._init_error = None
         self._unavailable_reason_code = "never_initialized"
@@ -2126,7 +2223,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 self._memory = mem
                 self._beam = mem.beam
-                self._ambient_key = self._init_key
+                self._ambient_key = init_key
                 logger.info(
                     "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
                     self._session_id, bank_name, mem.db_path,
@@ -2142,7 +2239,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if kwargs.get("channel_id"):
                     beam_kwargs["channel_id"] = kwargs["channel_id"]
                 self._beam = BeamMemory(**beam_kwargs)
-                self._ambient_key = self._init_key
+                self._ambient_key = init_key
                 logger.info(
                     "Mnemosyne initialized: session=%s, db=%s",
                     self._session_id, db_path or "default",

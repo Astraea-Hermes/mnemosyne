@@ -205,3 +205,85 @@ def test_canonical_writes_carry_writer_provenance_at_rest(tmp_path, fake_host):
             f"{home.name}: writer_home {writer_home!r} does not name the "
             "writing turn's home"
         )
+
+
+def test_initialize_reads_and_writes_share_the_new_home_slot(tmp_path, fake_host):
+    """#1050 review point 2: mid-init, getters must not read the PREVIOUS
+    home's ambient slot while setters target the home under construction.
+    Pre-fix, B's bank path inherited A's identity through that skew."""
+    home_a = _seed_home(tmp_path, "align-home-a")
+    home_b = _seed_home(tmp_path, "align-home-b")
+
+    ctx = _RegisteringCtx()
+    provider = register_memory_provider(ctx)
+
+    fake_host["home"] = str(home_a)
+    fake_host["profile"] = "profile_a"
+    provider.initialize(
+        "sess-a", hermes_home=str(home_a), agent_context="primary",
+        agent_identity="profile_a",
+    )
+
+    # Initialize B WHILE A's turn scope is still current: the exact skew the
+    # reviewer probed. Every B binding write must resolve to B's slot.
+    fake_host["home"] = str(home_a)
+    fake_host["profile"] = "profile_a"
+    provider.initialize(
+        "sess-b", hermes_home=str(home_b), agent_context="primary",
+        agent_identity="profile_b",
+    )
+
+    bindings = provider.__dict__["_bindings"]
+    b_key = str(home_b)
+    assert b_key in bindings, "B's slot was never created — writes went elsewhere"
+    assert bindings[b_key]["agent_identity"] == "profile_b", (
+        "B's identity landed outside B's slot (read/write skew during init)"
+    )
+    # Under B's turn, the getter resolves to the very slot the init wrote.
+    # Pre-fix this read A's slot entirely: B's bank path inherited A's
+    # session/identity through the getter/setter skew.
+    fake_host["home"] = str(home_b)
+    assert provider._session_id == "hermes_sess-b", (
+        "B's reads did not resolve to B's freshly written slot"
+    )
+    assert bindings[b_key]["session_id"] == "hermes_sess-b"
+    # A's slot keeps its own identity untouched by B's init.
+    fake_host["home"] = str(home_a)
+    assert provider._session_id == "hermes_sess-a"
+    # The init routing key must not outlive the init that set it.
+    assert provider.__dict__.get("_init_home") is None, (
+        "_init_home survived initialization; later writes would be steered "
+        "into the last-initialized home's slot"
+    )
+
+
+def test_session_switch_after_later_init_targets_the_turn_home(tmp_path, fake_host):
+    """#1050 review point 2 residue probe: after A→B init, an A session
+    switch must update A's binding, not the stored B slot."""
+    home_a = _seed_home(tmp_path, "switch-home-a")
+    home_b = _seed_home(tmp_path, "switch-home-b")
+
+    ctx = _RegisteringCtx()
+    provider = register_memory_provider(ctx)
+
+    fake_host["home"] = str(home_a)
+    provider.initialize(
+        "sess-a", hermes_home=str(home_a), agent_context="primary",
+        agent_identity="profile_a",
+    )
+    fake_host["home"] = str(home_b)
+    provider.initialize(
+        "sess-b", hermes_home=str(home_b), agent_context="primary",
+        agent_identity="profile_b",
+    )
+
+    fake_host["home"] = str(home_a)
+    provider.on_session_switch("sess-a2")
+
+    bindings = provider.__dict__["_bindings"]
+    assert bindings[str(home_a)]["session_id"].endswith("sess-a2"), (
+        "the A switch never reached A's slot"
+    )
+    assert not bindings[str(home_b)]["session_id"].endswith("sess-a2"), (
+        "residue steering: the A session switch updated B's stored slot"
+    )
