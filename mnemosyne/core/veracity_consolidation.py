@@ -344,7 +344,14 @@ class VeracityConsolidator:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_cf_predicate ON consolidated_facts(predicate)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_cf_object ON consolidated_facts(object)")
         
-        # Conflicts table
+        # Conflicts table. Did it exist before this call? A pre-existing
+        # conflicts table may already hold duplicate normalized pairs, and
+        # adding the unique index unconditionally would raise IntegrityError
+        # in __init__ — so the consolidator could not open that bank at all,
+        # defeating the E8 migration whose job is to REPORT those duplicates.
+        _conflicts_preexisting = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"
+        ).fetchone() is not None
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS conflicts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -356,16 +363,19 @@ class VeracityConsolidator:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Order-normalized pair key (fresh banks only; existing banks get it
-        # from the E8 package migration, since CREATE TABLE IF NOT EXISTS
-        # never retrofits a DDL change). min/max because the detector does
-        # not canonicalize orientation — 15 of 32 persisted rows measured
-        # 2026-09-26 violate fact_a_id < fact_b_id, so a plain (a, b) unique
-        # key cannot see the swapped pair.
-        cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_pair_norm "
-            "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
-        )
+        # Order-normalized pair key. Fresh banks get it here; existing banks
+        # get it from the E8 package migration (CREATE TABLE IF NOT EXISTS
+        # never retrofits a DDL change onto a populated table, and forcing it
+        # would take down a duplicate-laden bank — see the preexisting gate
+        # above). min/max because the detector does not canonicalize
+        # orientation — 15 of 32 persisted rows measured 2026-09-26 violate
+        # fact_a_id < fact_b_id, so a plain (a, b) unique key cannot see the
+        # swapped pair.
+        if not _conflicts_preexisting:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_pair_norm "
+                "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
+            )
         
         self.conn.commit()
     

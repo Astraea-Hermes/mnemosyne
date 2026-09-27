@@ -57,13 +57,19 @@ _INDEX_DDL = (
 )
 
 # Normalized-pair predicate, reused for the pre-flight duplicate sweep.
+# Group by the two min/max ID EXPRESSIONS, not a slash-joined string: the
+# join is ambiguous — (cf_a/b, cf_c) and (cf_a, cf_b/c) both stringify to
+# cf_a/b/cf_c, so a joined key would report two genuinely distinct pairs as
+# duplicates and wrongly refuse to build the index. SQLite's 2-arg
+# min()/max() (scalar) give the same orientation normalization the unique
+# index uses, and the pair is formatted for reporting only after grouping.
 _DUPLICATE_PAIRS_SQL = """
-    SELECT CASE WHEN fact_a_id < fact_b_id
-                THEN fact_a_id || '/' || fact_b_id
-                ELSE fact_b_id || '/' || fact_a_id END AS pair,
-           COUNT(*) AS n
-      FROM conflicts
-     GROUP BY pair
+    SELECT lo, hi, COUNT(*) AS n FROM (
+        SELECT min(fact_a_id, fact_b_id) AS lo,
+               max(fact_a_id, fact_b_id) AS hi
+          FROM conflicts
+    )
+     GROUP BY lo, hi
     HAVING n > 1
 """
 
@@ -104,7 +110,9 @@ def _duplicate_pairs(conn: sqlite3.Connection) -> List[str]:
     except sqlite3.OperationalError:
         # No conflicts table (or unreadable shape) — nothing to sweep.
         return []
-    return [str(r[0]) for r in rows]
+    # Display form only; grouping already happened on the unambiguous
+    # (lo, hi) expression pair.
+    return [f"{r[0]}/{r[1]}" for r in rows]
 
 
 @overload
@@ -133,11 +141,14 @@ def migrate_conflict_pair_key(
         "index_added": False,
         "duplicate_pairs": [],
     }
+    # The discriminator is set up front: EVERY early return below is still
+    # a MigrationDryRunReport when dry_run was requested, and consumers
+    # (CLI JSON) read report["dry_run"] unconditionally on that branch.
+    if dry_run:
+        report["dry_run"] = True  # type: ignore[typeddict-item]
 
     if not db_path.exists():
         report["conflicts_table_missing"] = True
-        if dry_run:
-            report["dry_run"] = True  # type: ignore[typeddict-item]
         return report
 
     conn = sqlite3.connect(str(db_path))
@@ -162,7 +173,6 @@ def migrate_conflict_pair_key(
         if dry_run:
             report["index_added"] = True
             report["applied"] = True
-            report["dry_run"] = True  # type: ignore[typeddict-item]
             return report  # type: ignore[return-value]
 
         conn.execute(_INDEX_DDL)

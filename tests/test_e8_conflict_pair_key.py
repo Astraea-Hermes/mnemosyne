@@ -90,8 +90,10 @@ def _ids(db_path: Path) -> set:
 
 
 def test_migration_adds_index_and_preserves_rows(tmp_path):
-    # Third row is orientation-swapped against the second — the shape a
-    # two-column unique key cannot normalize.
+    # The third row shares its low member with the second but is a distinct
+    # pair — it guards that the sweep groups the FULL normalized pair, not
+    # one member. It is NOT an orientation swap of the second row (that would
+    # be (cf_d, cf_c)); none of these rows are duplicates.
     bank = _legacy_bank(
         tmp_path / "bank.db",
         [
@@ -109,6 +111,30 @@ def test_migration_adds_index_and_preserves_rows(tmp_path):
     assert report["duplicate_pairs"] == []
     assert _index_present(bank) is True
     assert _ids(bank) == before_ids  # index-only: no row written, none deleted
+
+    # The MIGRATED index must enforce normalized uniqueness, not merely
+    # exist under the right name: re-landing the reverse orientation of an
+    # existing pair is the same contradiction and must be refused.
+    con = sqlite3.connect(str(bank))
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type) "
+                "VALUES ('cf_b', 'cf_a', 'contradiction')"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type) "
+                "VALUES ('cf_a', 'cf_b', 'contradiction')"
+            )
+        # A distinct pair still inserts cleanly (the key is pair-normalized,
+        # not member-global).
+        con.execute(
+            "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type) "
+            "VALUES ('cf_e', 'cf_f', 'contradiction')"
+        )
+    finally:
+        con.close()
 
 
 def test_migration_is_idempotent(tmp_path):
@@ -222,3 +248,73 @@ def test_index_is_what_makes_the_bare_insert_unsafe(tmp_path):
         assert _row_count(db_path) == 1
     finally:
         consolidator.conn.close()
+
+
+def test_consolidator_opens_duplicate_laden_legacy_bank(tmp_path):
+    """Fresh-bank gate (CodeRabbit Major on the head): a pre-existing bank
+    holding duplicate normalized pairs must still OPEN. Before the gate,
+    CREATE UNIQUE INDEX in _init_tables raised IntegrityError for such a
+    bank — every VeracityConsolidator(db_path=...) on it died, including
+    the E8 migration's own reporter path. Indexing that bank is the E8
+    migration's job, and E8's job is to REPORT the duplicates, not to be
+    pre-empted by a constructor crash."""
+    db_path = tmp_path / "legacy.db"
+    _legacy_bank(db_path, [
+        ("cf_x", "cf_y", "contradiction"),
+        ("cf_y", "cf_x", "contradiction"),  # same normalized pair, swapped
+    ])
+
+    consolidator = VeracityConsolidator(db_path=db_path)  # must not raise
+    try:
+        assert _index_present(db_path) is False, (
+            "the inline DDL must not force an index onto a populated legacy bank"
+        )
+    finally:
+        consolidator.conn.close()
+
+    # And the migration still sees the bank honestly: it reports the
+    # duplicate pair and refuses to write, rather than the opener exploding.
+    report = migrate_conflict_pair_key(db_path)
+    assert report["applied"] is False
+    assert report["duplicate_pairs"] == ["cf_x/cf_y"]
+
+
+def test_duplicate_sweep_groups_by_pair_not_by_joined_string(tmp_path):
+    """Slash-joined pair keys are ambiguous (CodeRabbit Major on the head):
+    rows (b/c, a) and (a/b, c) normalize to the distinct pairs (a, b/c) and
+    (a/b, c) — but BOTH stringify to "a/b/c", so a joined GROUP BY reports a
+    false duplicate and the migration refuses forever. Grouping now happens
+    on the (min, max) expressions, which only two genuinely identical
+    normalized pairs can collide under."""
+    db_path = tmp_path / "slashy.db"
+    _legacy_bank(db_path, [
+        ("b/c", "a", "contradiction"),
+        ("a/b", "c", "contradiction"),
+    ])
+
+    report = migrate_conflict_pair_key(db_path)
+    assert report["duplicate_pairs"] == [], (
+        "distinct slash-containing pairs were mistaken for duplicates: "
+        f"{report['duplicate_pairs']}"
+    )
+    assert report["index_added"] is True
+    assert _index_present(db_path) is True
+
+
+def test_dry_run_report_carries_discriminator_on_every_branch(tmp_path):
+    """MigrationDryRunReport promises report["dry_run"] on EVERY dry-run
+    outcome (CodeRabbit Minor on the head): table-missing, index-present,
+    duplicate-laden and would-add branches all must carry the key — the
+    CLI consumer reads it unconditionally."""
+    missing = tmp_path / "nope.db"
+    dup = tmp_path / "dup.db"
+    _legacy_bank(dup, [("cf_x", "cf_y", "c"), ("cf_y", "cf_x", "c")])
+    migrated = tmp_path / "mig.db"
+    _legacy_bank(migrated, [("cf_a", "cf_b", "c")])
+    assert migrate_conflict_pair_key(migrated)["index_added"] is True
+
+    for path in (missing, dup, migrated):
+        report = migrate_conflict_pair_key(path, dry_run=True)
+        assert report["dry_run"] is True, path
+    # Real (non-dry) reports must not claim the discriminator.
+    assert "dry_run" not in migrate_conflict_pair_key(dup)
