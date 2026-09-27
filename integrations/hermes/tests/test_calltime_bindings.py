@@ -279,6 +279,27 @@ def test_provider_canonical_write_stamps_writer(tmp_path, monkeypatch):
     assert row["writer_home"] == str(tmp_path / "active-home")
 
 
+def test_task_progress_write_carries_writer_stamp(tmp_path, monkeypatch):
+    """task:progress rows are canonical writes — the attribution lane was
+    storing them with EMPTY writer fields (CodeRabbit on 9ae0531: the
+    remember() call in _handle_task_progress predated the writer args)."""
+    _install_fake_hermes_modules(monkeypatch, tmp_path, "alice")
+    p = _provider(tmp_path, monkeypatch)
+    p._agent_identity = "alice"
+
+    out = json.loads(p._handle_task_progress(
+        {"action": "set", "task": "t1", "state": "halfway"}
+    ))
+    assert out["status"] == "set", out
+
+    row = p._beam.canonical.recall("alice", "task:progress", "t1")
+    assert row is not None
+    assert row["writer_id"] == "alice", (
+        "task:progress landed without the active profile's writer stamp"
+    )
+    assert row["writer_home"] == str(tmp_path / "active-home")
+
+
 def test_canonical_write_guard_fails_closed_on_mismatch(tmp_path, monkeypatch):
     profiles = _install_fake_hermes_modules(monkeypatch, tmp_path, "alice")
     p = _provider(tmp_path, monkeypatch)

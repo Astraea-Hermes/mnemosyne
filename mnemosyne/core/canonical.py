@@ -453,8 +453,11 @@ class CanonicalStore:
         - **No id collision**: insert with the imported ``id``
           (``stats["inserted"]``).
         - **Id collision + identical content**: skip (``stats["skipped"]``).
-        - **Id collision + different content**: insert with a fresh
-          auto-assigned id (``stats["imported_renumbered"]``).
+        - **Id collision + different content**: insert with a fresh auto-assigned id (``stats["imported_renumbered"]``).
+          "Content" includes ``writer_id`` — the same bytes re-attributed to
+          a different writer are not the same fact and are never silently
+          skipped; blank/absent writer compares equal to ``"imported"``.
+          ``writer_home`` is store-local and never compared.
         - **No id supplied**: insert with a fresh id (``stats["inserted"]``).
         - ``force=True``: on id collision, overwrite
           (``stats["overwritten"]``).
@@ -471,14 +474,24 @@ class CanonicalStore:
 
         _CONTENT_FIELDS = ("owner_id", "category", "name", "body", "source",
                            "confidence", "version", "valid_from", "valid_until",
-                           "created_at")
-        _INSERT_DEFAULTS = {"source": "imported", "confidence": 1.0, "version": 1}
+                           "created_at", "writer_id")
+        _INSERT_DEFAULTS = {"source": "imported", "confidence": 1.0, "version": 1,
+                            "writer_id": "imported"}
 
         def _normalized(item):
-            return {
+            out = {
                 f: item.get(f) if item.get(f) is not None else _INSERT_DEFAULTS.get(f)
                 for f in _CONTENT_FIELDS
             }
+            # The blank writer (legacy pre-provenance rows) and an absent
+            # writer key are the same statement of fact: unknown authorship,
+            # which INSERT records as "imported". Compare on that identity so
+            # legacy exports round-trip as equal, while an EXPLICIT writer
+            # that differs from the stored one is a provenance divergence —
+            # never a silent skip (writer_home is store-local and excluded).
+            if not out.get("writer_id"):
+                out["writer_id"] = "imported"
+            return out
 
         seen_ids = set()
         for item in rows:
@@ -498,9 +511,12 @@ class CanonicalStore:
                 "version, valid_from, valid_until, created_at, writer_id, "
                 "writer_home FROM canonical_facts"
             ).fetchall()
-            existing_snapshot = {
-                r[0]: dict(zip(_CONTENT_FIELDS, r[1:])) for r in existing
-            }
+            existing_snapshot = {}
+            for r in existing:
+                snap = dict(zip(_CONTENT_FIELDS, r[1:]))
+                if not snap.get("writer_id"):
+                    snap["writer_id"] = "imported"
+                existing_snapshot[r[0]] = snap
 
             def _insert_with_id(item, row_id):
                 cursor.execute(

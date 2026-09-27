@@ -4535,6 +4535,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             from mnemosyne.core.canonical import CanonicalStore
             store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
             self._beam.canonical = store
+        # Same writer-stamp derivation as _handle_remember_canonical: a
+        # task:progress row is a canonical write and the attribution lane
+        # must be able to answer who set the state (#1050 CR round).
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            from hermes_constants import get_hermes_home
+            _wid, _whome = (get_active_profile_name() or ""), str(get_hermes_home())
+        except Exception:
+            _wid, _whome = "", ""
 
         if action == "set":
             if not task:
@@ -4550,6 +4559,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 category="task:progress",
                 name=task,
                 body=body,
+                # task:progress IS a canonical write — stamp it like every
+                # other one (CodeRabbit on 9ae0531: empty writer fields on
+                # rows the attribution lane exists to audit).
+                writer_id=_wid, writer_home=_whome,
             )
             if row is None:
                 return json.dumps({"status": "filtered", "store": "canonical"})
