@@ -356,6 +356,16 @@ class VeracityConsolidator:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Order-normalized pair key (fresh banks only; existing banks get it
+        # from the E8 package migration, since CREATE TABLE IF NOT EXISTS
+        # never retrofits a DDL change). min/max because the detector does
+        # not canonicalize orientation — 15 of 32 persisted rows measured
+        # 2026-09-26 violate fact_a_id < fact_b_id, so a plain (a, b) unique
+        # key cannot see the swapped pair.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_pair_norm "
+            "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
+        )
         
         self.conn.commit()
     
@@ -584,9 +594,18 @@ class VeracityConsolidator:
             in the inline version; preserved in the DRY refactor.
         """
         cursor = self.conn.cursor()
+        # Targetless upsert, paired with idx_conflicts_pair_norm (created
+        # here for fresh banks and by the E8 package migration for existing
+        # ones). A bare INSERT would raise IntegrityError on the swapped
+        # pair (b, a) — the index is on (min, max) — inside a caller's
+        # _serialized_write scope, which is the partial-state class this
+        # method's docstring already guards. No conflict target is named:
+        # a targetless DO NOTHING covers every uniqueness violation on this
+        # table without repeating the indexed expression verbatim.
         cursor.execute("""
             INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type)
             VALUES (?, ?, ?)
+            ON CONFLICT DO NOTHING
         """, (fact_a_id, fact_b_id, conflict_type))
         if commit:
             self.conn.commit()
