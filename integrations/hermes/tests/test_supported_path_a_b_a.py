@@ -29,7 +29,6 @@ import types
 
 import pytest
 
-import mnemosyne_hermes
 from mnemosyne_hermes import register_memory_provider
 
 
