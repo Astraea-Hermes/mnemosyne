@@ -147,6 +147,77 @@ def test_out_of_turn_still_uses_ambient_binding(tmp_path, monkeypatch):
     assert p._beam is beam_a
 
 
+def test_failed_second_home_init_restores_ambient_reads(tmp_path, monkeypatch):
+    """A failed initialize(home-b) must not black out home-a's service.
+
+    CodeRabbit point on #1050 (head 9ae0531): _initialize_locked mirrors the
+    target home into _ambient_key BEFORE construction; when construction
+    raises, B's slot is left empty but the ambient key stayed on B — so
+    out-of-turn readers (cron prefetch, teardown flush) resolved to the dead
+    B slot instead of the still-live home-a binding.
+    """
+    class _BeamThatDiesForB(_RecordingBeam):
+        def __init__(self, *args, db_path=None, **kwargs):
+            if db_path is not None and "home-b" in str(db_path):
+                raise sqlite3.OperationalError("simulated corrupt store")
+            super().__init__(*args, db_path=db_path, **kwargs)
+
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _BeamThatDiesForB)
+    p = MnemosyneMemoryProvider()
+
+    _HOME.set("home-a")
+    p.initialize("sess-a", hermes_home="home-a")
+    beam_a = p._beam
+    assert beam_a is not None
+
+    _HOME.set("home-b")
+    p.initialize("sess-b", hermes_home="home-b")
+    assert p._init_error is not None, "B's construction failure must be recorded"
+    assert p.__dict__.get("_retry_init_args") is None, (
+        "corrupt-store failure is non-transient: no retry may be pending, "
+        "or the ambient restore would (correctly) not fire and this test "
+        "would pin the wrong arm"
+    )
+
+    # In-turn reads still address B's own (empty) slot — never home-a's beam:
+    # a turn scoped to the home that failed must not silently reroute.
+    _HOME.set("home-b")
+    assert p._beam is None, "dead B turn must read empty, not reroute to A"
+    _HOME.set("home-a")
+    assert p._beam is beam_a, "A's own turn must still reach A's beam"
+
+    # THE FIX: out-of-turn reads fall back to the last LIVE ambient (home-a),
+    # not to the dead ambient that the failed init left behind.
+    _HOME.set(None)
+    assert p._beam is beam_a, (
+        "failed init stranded the ambient key on the dead home; out-of-turn "
+        "service (cron/teardown) was blacked out by an unrelated home's failure"
+    )
+
+
+def test_skip_context_init_does_not_restore_previous_ambient(tmp_path, monkeypatch):
+    """Deliberate skip contexts stay unavailable — the ambient key must
+    remain on the skip slot so system_prompt_block() reports the skip, not a
+    stale 'Active' from the previous home (C13/C27 contract). The restore
+    added for failed inits must NOT widen to this path."""
+    monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: _RecordingBeam)
+    p = MnemosyneMemoryProvider()
+
+    _HOME.set("home-a")
+    p.initialize("sess-a", hermes_home="home-a")
+    beam_a = p._beam
+
+    _HOME.set("home-b")
+    p.initialize("sess-b", hermes_home="home-b", agent_context="subagent")
+    assert p._unavailable_reason_code == "skipped_context"
+
+    _HOME.set(None)
+    assert p._beam is not beam_a, (
+        "skip-context init must keep the provider reading as its own empty "
+        "slot, not reclaim the previous home's live binding"
+    )
+
+
 # --------------------------------------------------------------------------
 # Writer provenance on canonical facts
 # --------------------------------------------------------------------------

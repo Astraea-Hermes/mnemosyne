@@ -180,7 +180,19 @@ def test_canonical_writes_carry_writer_provenance_at_rest(tmp_path, fake_host):
     )
     _write_canonical(provider, "b1", "stamp check B")
 
-    for home, want_writer in ((home_a, "profile_a"), (home_b, "profile_b")):
+    # THE A→B→A STEP, provenance arm (CodeRabbit on 9ae0531): placement of
+    # a2 (test above) does not pin its STAMP — a returning-A write could
+    # land in A's store wearing B's provenance while both original arms
+    # stayed green. Each row is now selected by name, not "latest row".
+    fake_host["home"] = str(home_a)
+    fake_host["profile"] = "profile_a"
+    _write_canonical(provider, "a2", "stamp check returning A")
+
+    expect = {
+        home_a: (("a1", "profile_a"), ("a2", "profile_a")),
+        home_b: (("b1", "profile_b"),),
+    }
+    for home, rows in expect.items():
         db = _store(home)
         assert db.exists()
         conn = sqlite3.connect(str(db))
@@ -189,22 +201,26 @@ def test_canonical_writes_carry_writer_provenance_at_rest(tmp_path, fake_host):
             assert "writer_id" in cols and "writer_home" in cols, (
                 "canonical rows carry no writer-provenance columns"
             )
-            row = conn.execute(
-                "SELECT writer_id, writer_home FROM canonical_facts "
-                "WHERE category='regression' ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
+            for name, want_writer in rows:
+                row = conn.execute(
+                    "SELECT writer_id, writer_home FROM canonical_facts "
+                    "WHERE category='regression' AND name=? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (name,),
+                ).fetchone()
+                assert row is not None, f"{home.name}: {name!r} never landed"
+                writer_id, writer_home = row
+                assert writer_id == want_writer, (
+                    f"{home.name}: row {name!r} written under a {want_writer} "
+                    f"turn carries writer_id={writer_id!r} — provenance would "
+                    "misattribute the write"
+                )
+                assert writer_home and str(writer_home) == str(home), (
+                    f"{home.name}: writer_home {writer_home!r} does not name "
+                    "the writing turn's home"
+                )
         finally:
             conn.close()
-        assert row is not None
-        writer_id, writer_home = row
-        assert writer_id == want_writer, (
-            f"{home.name}: row written under a {want_writer} turn carries "
-            f"writer_id={writer_id!r} — provenance would misattribute the write"
-        )
-        assert writer_home and str(writer_home) == str(home), (
-            f"{home.name}: writer_home {writer_home!r} does not name the "
-            "writing turn's home"
-        )
 
 
 def test_initialize_reads_and_writes_share_the_new_home_slot(tmp_path, fake_host):

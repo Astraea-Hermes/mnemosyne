@@ -2067,14 +2067,54 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Initialize Mnemosyne beam for this session."""
         with self._ensure_beam_access_lock():
             with self._ensure_surface_adapter_lock():
+                previous_ambient = self.__dict__.get("_ambient_key", "default")
                 try:
                     self._initialize_locked(session_id, **kwargs)
+                except BaseException:
+                    # A failure propagating out of _initialize_locked may have
+                    # already mirrored the target home into the ambient key.
+                    # An empty target slot must not black out the home that
+                    # was serving before this attempt (#1050 CR round).
+                    self._restore_ambient_if_dead(previous_ambient)
+                    raise
+                else:
+                    # Deliberate skip contexts (subagent/cron re-inits) keep
+                    # the empty target ambient ON PURPOSE: restoring the
+                    # previous home's live beam here would make
+                    # system_prompt_block() report "Active" for a session
+                    # that just decided to stay silent (C13/C27 contract).
+                    if getattr(self, "_unavailable_reason_code", "") not in (
+                        "skipped_context",
+                        "reset_by_reinit",
+                    ):
+                        self._restore_ambient_if_dead(previous_ambient)
                 finally:
                     # The init routing key is scoped to this init only: an
                     # A→B→A session switch must never keep steering writes
                     # into B's slot after B finished initializing
                     # (#1050 review point 2, `_init_key` residue probe).
                     self.__dict__["_init_home"] = None
+
+    def _restore_ambient_if_dead(self, previous_ambient: str) -> None:
+        """Give the out-of-turn reads back to the previous ambient home.
+
+        Only when the current ambient slot holds no Beam AND no transient
+        retry is pending for the failed home: that retry stashes the exact
+        init args and relies on the per-turn surfaces finding the ambient
+        slot empty (``_beam is None``) to fire — stealing ambient away
+        would silently disarm it. A hard (non-transient) failure has no
+        recovery path, so leaving ambient stranded on the dead home would
+        black out a healthy home's cron/teardown service instead.
+        """
+        if self.__dict__.get("_retry_init_args") is not None:
+            return
+        key = self.__dict__.get("_ambient_key", "default")
+        if key == previous_ambient:
+            return
+        slot = self.__dict__.get("_bindings", {}).get(key)
+        if slot is not None and slot.get("beam") is not None:
+            return
+        self.__dict__["_ambient_key"] = previous_ambient
 
     def _initialize_locked(self, session_id: str, **kwargs) -> None:
         """Rebuild provider state while the Beam access lock is held."""
