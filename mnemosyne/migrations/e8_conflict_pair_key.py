@@ -42,18 +42,22 @@ canonical definition, and a matching one is a no-op. A same-named index
 carrying a DIFFERENT definition is an explicit failure
 (``IndexDefinitionMismatchError``) — never a reported success.
 
-An existing ``conflicts`` table that lacks the pair columns is likewise
-an explicit failure (``ConflictSchemaUnreadableError``), in real and dry
-runs alike: a dry run that promises ``index_added`` over a schema the
-constraint can never attach to is the same false green this module
-refuses everywhere else.
+An existing ``conflicts`` table that lacks the pair columns — or declares
+either one nullable — is likewise an explicit failure
+(``ConflictSchemaUnreadableError``), in real and dry runs alike: a dry
+run that promises ``index_added`` over a schema the constraint cannot
+fully enforce is the same false green this module refuses everywhere
+else. Nullable is not cosmetic: SQLite unique indexes treat NULL keys as
+distinct, so NULL-bearing rows would re-grow the ledger under an index
+reported applied. The canonical core DDL declares both pair columns
+``NOT NULL`` — this refusal only ever names foreign schemas.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import List, Literal, TypedDict, Union, overload
+from typing import List, Literal, Tuple, TypedDict, Union, overload
 
 
 # Canonical DDL — mirrors the index that belongs beside
@@ -91,13 +95,17 @@ class IndexDefinitionMismatchError(RuntimeError):
 class ConflictSchemaUnreadableError(RuntimeError):
     """The ``conflicts`` table exists but cannot host the pair index.
 
-    The duplicate sweep and the index DDL both read ``fact_a_id`` and
-    ``fact_b_id``; against a table without them every E8 statement
-    raises ``sqlite3.OperationalError``. A dry run that reported
-    ``index_added`` here would predict a success the real pass cannot
-    deliver — the same false green as accepting an index by name alone.
-    Both modes therefore fail loudly, bank untouched. Repair the table,
-    then re-run.
+    Two shapes are refused. Missing pair columns: the duplicate sweep
+    and the index DDL both read ``fact_a_id``/``fact_b_id``, so against
+    a table without them every E8 statement raises
+    ``sqlite3.OperationalError``. Nullable pair columns: the index can
+    be created but cannot enforce — SQLite unique indexes treat NULL
+    keys as distinct, so NULL-bearing rows slip the constraint under an
+    index reported applied. Either way a dry run promising
+    ``index_added`` would predict a success the schema defeats — the
+    same false green as accepting an index by name alone. Both modes
+    therefore fail loudly, bank untouched. Repair the table, then
+    re-run.
     """
 
 # Normalized-pair predicate, reused for the pre-flight duplicate sweep.
@@ -148,8 +156,14 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 _REQUIRED_CONFLICT_COLUMNS = ("fact_a_id", "fact_b_id")
 
 
-def _conflicts_columns(conn: sqlite3.Connection) -> List[str]:
-    return [row[1] for row in conn.execute("PRAGMA table_info(conflicts)")]
+def _conflicts_columns(conn: sqlite3.Connection) -> List[Tuple[str, int]]:
+    """(name, notnull) per column of the existing ``conflicts`` table.
+
+    ``PRAGMA table_info`` reports the NOT NULL declaration flag as 0/1;
+    the gate below uses it because a nullable pair column defeats the
+    unique index (NULL keys are distinct) even though the columns exist.
+    """
+    return [(row[1], row[3]) for row in conn.execute("PRAGMA table_info(conflicts)")]
 
 
 def _index_ddl(conn: sqlite3.Connection, name: str) -> Union[str, None]:
@@ -206,10 +220,10 @@ def migrate_conflict_pair_key(
     when duplicate pairs make a unique index impossible today. A same-named
     existing index is validated against the canonical definition; a
     mismatch raises IndexDefinitionMismatchError (explicit failure, bank
-    untouched) rather than falsely reporting ``applied=True``. An existing
-    table that lacks the pair columns raises ConflictSchemaUnreadableError
-    in EITHER mode — a dry run never promises an index the schema cannot
-    host.
+    untouched) rather than falsely reporting ``applied=True``. An
+    existing table that lacks the pair columns, or declares either one
+    nullable, raises ConflictSchemaUnreadableError in EITHER mode — a
+    dry run never promises an index the schema cannot fully enforce.
     """
     report: MigrationReport = {
         "applied": False,
@@ -248,17 +262,32 @@ def migrate_conflict_pair_key(
             return report  # type: ignore[return-value]
 
         # An existing table with an unreadable shape is NOT the
-        # missing-table case reported above: here every E8 statement
-        # raises. A dry run that sets index_added/applied over such a
-        # schema promises a constraint a real pass can never build —
-        # refuse in both modes, explicitly, bank untouched.
-        found = {c.casefold() for c in _conflicts_columns(conn)}
+        # missing-table case reported above. Missing pair columns: every
+        # E8 statement raises. Nullable pair columns: the index builds
+        # but cannot enforce (SQLite unique indexes treat NULL keys as
+        # distinct, so NULL-bearing rows slip it). Either way a dry run
+        # setting index_added/applied promises a constraint the schema
+        # defeats — refuse in both modes, explicitly, bank untouched.
+        columns = _conflicts_columns(conn)
+        found = {name.casefold() for name, _ in columns}
         missing = [c for c in _REQUIRED_CONFLICT_COLUMNS if c not in found]
         if missing:
             raise ConflictSchemaUnreadableError(
                 "conflicts table exists but does not expose the pair "
                 f"columns E8 needs; missing: {', '.join(missing)}; found: "
                 f"{', '.join(sorted(found)) or '(no columns)'}"
+            )
+        nullable = sorted(
+            name
+            for name, notnull in columns
+            if not notnull and name.casefold() in _REQUIRED_CONFLICT_COLUMNS
+        )
+        if nullable:
+            raise ConflictSchemaUnreadableError(
+                "conflicts table exposes the pair columns but declares "
+                "them nullable; a UNIQUE index does not constrain NULL "
+                "keys, so E8 cannot honestly report the normalized pair "
+                f"key as enforced; nullable: {', '.join(nullable)}"
             )
 
         duplicates = _duplicate_pairs(conn)

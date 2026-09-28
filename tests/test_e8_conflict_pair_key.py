@@ -591,12 +591,14 @@ def test_missing_table_still_reports_rather_than_raises(tmp_path):
 def test_legacy_column_casing_is_not_a_refusal(tmp_path):
     """SQLite column names are case-insensitive; the gate compares
     casefolded, so a differently-cased canonical table is indexable and
-    must pass, not be refused as unreadable."""
+    must pass, not be refused as unreadable. Both columns are NOT NULL
+    here on purpose — the nullable-declaration refusal is a separate,
+    orthogonal gate (Round 4 below); this test isolates casing."""
     con_db = tmp_path / "mixed.db"
     con = sqlite3.connect(str(con_db))
     con.execute(
         "CREATE TABLE conflicts (id INTEGER PRIMARY KEY, "
-        "Fact_A_Id TEXT, Fact_B_Id TEXT, conflict_type TEXT)"
+        "Fact_A_Id TEXT NOT NULL, Fact_B_Id TEXT NOT NULL, conflict_type TEXT)"
     )
     con.execute(
         "INSERT INTO conflicts (Fact_A_Id, Fact_B_Id, conflict_type) "
@@ -638,4 +640,120 @@ def test_cli_migrate_fails_explicitly_on_unreadable_schema(
     assert excinfo.value.code == 1
     captured = capsys.readouterr()
     assert "does not expose the pair columns" in captured.err
+    assert _index_present(db_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Round 4 (CodeRabbit review on cda66e75, 2026-09-28): nullable pair
+# columns. The table exposes fact_a_id/fact_b_id, so the Round 3 gate
+# lets it pass and the UNIQUE index creates cleanly — and enforces
+# nothing against NULL-bearing rows: SQLite unique indexes treat NULL
+# keys as distinct, so duplicates re-grow under an index E8 reported
+# applied. The canonical core DDL declares both columns NOT NULL, so a
+# nullable pair column is a foreign shape no honest E8 run can
+# green-light. Refuse it in both modes, bank untouched, like every
+# other unreadable schema.
+# ---------------------------------------------------------------------------
+
+
+def _nullable_pair_bank(db_path: Path, nullable: str) -> Path:
+    """A conflicts table with ONE pair column declared nullable.
+
+    Everything else is canonical, isolating the NOT NULL flag as the
+    only difference from an indexable bank.
+    """
+    a = "fact_a_id TEXT" if nullable == "fact_a_id" else "fact_a_id TEXT NOT NULL"
+    b = "fact_b_id TEXT" if nullable == "fact_b_id" else "fact_b_id TEXT NOT NULL"
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        f"CREATE TABLE conflicts (id INTEGER PRIMARY KEY, {a}, {b}, "
+        "conflict_type TEXT)"
+    )
+    con.execute(
+        "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type) "
+        "VALUES ('cf_a', 'cf_b', 'contradiction')"
+    )
+    con.commit()
+    con.close()
+    return db_path
+
+
+def test_unique_index_genuinely_misses_nullable_rows(tmp_path):
+    """Grounding for the refusal, asserted on SQLite itself: on a
+    nullable-pair table the canonical index CREATES fine yet does not
+    stop duplicate NULL-bearing rows — reporting applied=True there is
+    a false green, not a technicality."""
+    bank = _nullable_pair_bank(tmp_path / "bank.db", "fact_a_id")
+    con = sqlite3.connect(str(bank))
+    con.execute(
+        f"CREATE UNIQUE INDEX {INDEX_NAME} "
+        "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
+    )
+    con.execute("INSERT INTO conflicts (fact_a_id, fact_b_id) VALUES (NULL, 'cf_x')")
+    con.execute("INSERT INTO conflicts (fact_a_id, fact_b_id) VALUES (NULL, 'cf_x')")
+    con.commit()
+    n = con.execute(
+        "SELECT COUNT(*) FROM conflicts WHERE fact_a_id IS NULL"
+    ).fetchone()[0]
+    con.close()
+    assert n == 2
+
+
+@pytest.mark.parametrize("column", ["fact_a_id", "fact_b_id"])
+def test_dry_run_refuses_nullable_pair_column(tmp_path, column):
+    bank = _nullable_pair_bank(tmp_path / "bank.db", column)
+
+    with pytest.raises(ConflictSchemaUnreadableError) as excinfo:
+        migrate_conflict_pair_key(bank, dry_run=True)
+
+    # Message names the gap precisely enough to repair without a shell.
+    assert "nullable" in str(excinfo.value)
+    assert column in str(excinfo.value)
+    assert _index_present(bank) is False
+
+
+@pytest.mark.parametrize("column", ["fact_a_id", "fact_b_id"])
+def test_real_run_refuses_nullable_pair_column(tmp_path, column):
+    bank = _nullable_pair_bank(tmp_path / "bank.db", column)
+
+    with pytest.raises(ConflictSchemaUnreadableError):
+        migrate_conflict_pair_key(bank)
+
+    assert _index_present(bank) is False
+    assert _row_count(bank) == 1  # bank untouched
+
+
+def test_nullable_refusal_precedes_the_duplicate_sweep(tmp_path):
+    """The refusal is about the schema, not the data: the sweep's
+    GROUP BY treats NULLs as equal, so before the gate these rows would
+    have produced a 'duplicate pairs' report, not the named schema
+    refusal. The gate answers first."""
+    bank = _nullable_pair_bank(tmp_path / "bank.db", "fact_a_id")
+    con = sqlite3.connect(str(bank))
+    con.execute("INSERT INTO conflicts (fact_b_id) VALUES ('cf_c')")
+    con.execute(
+        "INSERT INTO conflicts (fact_a_id, fact_b_id) VALUES (NULL, 'cf_c')"
+    )
+    con.commit()
+    con.close()
+
+    with pytest.raises(ConflictSchemaUnreadableError) as excinfo:
+        migrate_conflict_pair_key(bank, dry_run=True)
+
+    assert "nullable" in str(excinfo.value)
+
+
+def test_cli_dry_run_fails_explicitly_on_nullable_pair_column(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = _cli_bank(tmp_path, monkeypatch)
+    _nullable_pair_bank(db_path, "fact_b_id")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_migrate(["--dry-run"])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "would add index" not in captured.out
+    assert "nullable" in captured.err
     assert _index_present(db_path) is False
