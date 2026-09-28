@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scales acceptance criterion — canon-sign chain head resolution. v6.
+"""Scales acceptance criterion — canon-sign chain head resolution. v7.
 Rides the re-host PR: runs GREEN only after keeper's (a) _handle_invalidate
 surface branch + (b) declared-edge replay land on the senses probe-chain-green build.
 
@@ -26,6 +26,17 @@ read txn, so a concurrent gateway writer committing between them could
 be scored as a state combination that never existed in the store; BEGIN
 before the first read pins one snapshot for the whole gate.
 
+v6->v7 (CodeRabbit review on PR #1050, nitpick at line 52: no fixture test
+interleaves a committed conflicts update between the two reads): module-level
+execution moved under __main__, so a bare import — pytest collecting tests/,
+which CI does — opens nothing (that import-time DB open was the test(3.13)
+collection crash on head 32f879ed, owed by us since). The pinned connection
+and the two snapshot reads are now named helpers; tests/test_canon_sign_gate_
+snapshot.py drives them with an interleaved-commit regression plus a
+no-transaction control, so dropping the read txn fails a test instead of
+reopening the mixed-state window. CLI behavior unchanged: same argv, same
+stdout, same exit codes.
+
 Design laws (rulings this encodes):
   - CHAIN membership: TRANSITIONAL anchor startswith (prose, labeled-for-
     removal). Never filename-cite — refs fragment 3 ways in body text (measured
@@ -43,16 +54,35 @@ Design laws (rulings this encodes):
 """
 import json, sqlite3, sys
 
-DB = sys.argv[1] if len(sys.argv) > 1 else \
-     "/home/famhome/.hermes/mnemosyne/data/shared/mnemosyne.db"
 SUBJECT_REF = "multiplex-profile-memory-isolation.md"
 
-db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-db.row_factory = sqlite3.Row
-db.execute("BEGIN")  # one read txn: working_memory (A0-A6) and conflicts (A7) share one snapshot
-rows = {r["id"]: r for r in db.execute(
-    "select id, content, valid_until, superseded_by, metadata_json, created_at "
-    "from working_memory")}
+
+def open_read_connection(db_path):
+    """Read-only connection pinned to ONE snapshot (v6 law, v7 home).
+
+    The BEGIN lives in this helper, not in the script flow: the fixture
+    regression drives the gate's own reads through here, so a refactor that
+    drops the read txn fails that test instead of silently reopening the
+    mixed-state window. mode=ro keeps the gate from ever writing.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("BEGIN")  # one read txn: working_memory (A0-A6) and conflicts (A7) share one snapshot
+    return conn
+
+
+def read_working_rows(db):
+    """Gate's A0-A6 read: every working_memory row, on the pinned snapshot."""
+    return {r["id"]: r for r in db.execute(
+        "select id, content, valid_until, superseded_by, metadata_json, created_at "
+        "from working_memory")}
+
+
+def read_unresolved_conflict_count(db):
+    """Gate's A7 read: unresolved conflicts rows, on the pinned snapshot."""
+    return db.execute("select count(*) n from conflicts "
+                      "where resolution is null or resolution=''").fetchone()["n"]
+
 
 def meta(r, key):
     try:
@@ -60,100 +90,110 @@ def meta(r, key):
     except Exception:
         return None
 
-arms = []
-def emit(arm, passed, evidence, ran=True):
-    ok = bool(passed) and ran
-    status = "GREEN" if ok else ("VACUOUS->RED" if ran and passed else "RED" if ran else "RED(no-run)")
-    arms.append((arm, ok))
-    print(f"ARM {arm} {status} :: {evidence}")
+if __name__ == "__main__":
+    # v7: execution is script-only. This file matches pytest's collection
+    # pattern (*_test.py) and CI collects tests/, so a bare import must open
+    # nothing. Run directly: `python tests/canon_sign_head_test.py [db]`.
+    DB = sys.argv[1] if len(sys.argv) > 1 else \
+         "/home/famhome/.hermes/mnemosyne/data/shared/mnemosyne.db"
+    db = open_read_connection(DB)
+    rows = read_working_rows(db)
 
-# --- membership (TRANSITIONAL prose anchor; remove when A0 greens) ---
-chain = [r for r in rows.values()
-         if r["content"].startswith("Surface meta: Astraea canon-sign row")]
-supps = [r for r in rows.values()
-         if meta(r, "supplements") and r not in chain]
-prose_supps = [r for r in rows.values()
-               if r not in chain and r not in supps
-               and r["content"].startswith("Surface meta: Astraea")
-               and "supplements, does not supersede" in r["content"]]
 
-open_ = lambda r: r["valid_until"] is None
+    arms = []
+    def emit(arm, passed, evidence, ran=True):
+        ok = bool(passed) and ran
+        status = "GREEN" if ok else ("VACUOUS->RED" if ran and passed else "RED" if ran else "RED(no-run)")
+        arms.append((arm, ok))
+        print(f"ARM {arm} {status} :: {evidence}")
 
-# A1 predicate sanity
-emit("A1", len(chain) >= 10,
-     f"anchor matched {len(chain)} chain rows (>=10 expected); "
-     f"supps typed={len(supps)} prose-detected={len(prose_supps)}")
 
-# A0 typed SUBJECT ref on every chain row. Key is `subject_ref`, NOT `ref` —
-# measured 2026-09-24: `metadata.ref` is already live with SEAL-DIGEST
-# semantics on v8 (bf7fc83b) and v10 (4693e144). Demanding the filename under
-# `ref` would collide semantics; `ref` stays seal provenance (why's ruling),
-# `subject_ref` is the uniform chain-membership key.
-no_ref = [r["id"] for r in chain if meta(r, "subject_ref") != SUBJECT_REF]
-emit("A0", not no_ref,
-     f"{len(chain)} rows checked metadata.subject_ref=='{SUBJECT_REF}'; lacking/wrong: {no_ref}")
+    # --- membership (TRANSITIONAL prose anchor; remove when A0 greens) ---
+    chain = [r for r in rows.values()
+             if r["content"].startswith("Surface meta: Astraea canon-sign row")]
+    supps = [r for r in rows.values()
+             if meta(r, "supplements") and r not in chain]
+    prose_supps = [r for r in rows.values()
+                   if r not in chain and r not in supps
+                   and r["content"].startswith("Surface meta: Astraea")
+                   and "supplements, does not supersede" in r["content"]]
 
-# successor targets: typed edges only (superseded_by or metadata.supersedes)
-succ = {r["superseded_by"] for r in rows.values() if r["superseded_by"]} \
-     | {meta(r, "supersedes") for r in rows.values() if meta(r, "supersedes")}
-heads = [r for r in chain if r["id"] not in succ and open_(r)]
+    open_ = lambda r: r["valid_until"] is None
 
-# A2 exactly one open head
-emit("A2", len(heads) == 1,
-     f"open heads={len(heads)} {[r['id'] for r in heads]} (target: exactly 1)")
+    # A1 predicate sanity
+    emit("A1", len(chain) >= 10,
+         f"anchor matched {len(chain)} chain rows (>=10 expected); "
+         f"supps typed={len(supps)} prose-detected={len(prose_supps)}")
 
-# A3 every open non-head chain/supp row has a typed out-edge
-# (v5: out-edge vocabulary = superseded_by | metadata.supersedes |
-# metadata.supplements — the same three forms A5 enumerates store-wide)
-nonhead_open = [r for r in chain + supps if open_(r) and r not in heads]
-bad3 = [r["id"] for r in nonhead_open
-        if not (r["superseded_by"] or meta(r, "supersedes") or meta(r, "supplements"))]
-emit("A3", not bad3,
-     f"{len(nonhead_open)} open non-head rows checked for typed out-edge "
-     f"(vocab: superseded_by|supersedes|supplements, per A5 parity); prose-only: {bad3}",
-     ran=bool(nonhead_open))
+    # A0 typed SUBJECT ref on every chain row. Key is `subject_ref`, NOT `ref` —
+    # measured 2026-09-24: `metadata.ref` is already live with SEAL-DIGEST
+    # semantics on v8 (bf7fc83b) and v10 (4693e144). Demanding the filename under
+    # `ref` would collide semantics; `ref` stays seal provenance (why's ruling),
+    # `subject_ref` is the uniform chain-membership key.
+    no_ref = [r["id"] for r in chain if meta(r, "subject_ref") != SUBJECT_REF]
+    emit("A0", not no_ref,
+         f"{len(chain)} rows checked metadata.subject_ref=='{SUBJECT_REF}'; lacking/wrong: {no_ref}")
 
-# A4 validity-stamped chain rows must also carry typed superseded_by
-stamped = [r for r in chain if not open_(r)]
-bad4 = [r["id"] for r in stamped if not r["superseded_by"]]
-emit("A4", not bad4,
-     f"{len(stamped)} stamped rows checked for superseded_by "
-     f"(idx_wm_context_global gates superseded_by IS NULL); still-query-live: {bad4}",
-     ran=True)  # runs with 0 stamped = pass only post-hygiene when none should exist
+    # successor targets: typed edges only (superseded_by or metadata.supersedes)
+    succ = {r["superseded_by"] for r in rows.values() if r["superseded_by"]} \
+         | {meta(r, "supersedes") for r in rows.values() if meta(r, "supersedes")}
+    heads = [r for r in chain if r["id"] not in succ and open_(r)]
 
-# A5 no dangling edges store-wide
-edges = [(r["id"], t) for r in rows.values()
-         for t in (r["superseded_by"], meta(r, "supersedes"),
-                   meta(r, "supplements")) if t]
-dangling = [f"{s}->{t}" for s, t in edges if t not in rows]
-emit("A5", not dangling, f"{len(edges)} typed edges checked; dangling: {dangling}",
-     ran=bool(edges))
+    # A2 exactly one open head
+    emit("A2", len(heads) == 1,
+         f"open heads={len(heads)} {[r['id'] for r in heads]} (target: exactly 1)")
 
-# A6a prose-declared supplements are honest red until replayed
-bad6a = [r["id"] for r in prose_supps]
-emit("A6a", not bad6a,
-     f"{len(prose_supps)} prose-only supplement declarations found (typed "
-     f"metadata.supplements required; why's honest-red ruling): {bad6a}")
+    # A3 every open non-head chain/supp row has a typed out-edge
+    # (v5: out-edge vocabulary = superseded_by | metadata.supersedes |
+    # metadata.supplements — the same three forms A5 enumerates store-wide)
+    nonhead_open = [r for r in chain + supps if open_(r) and r not in heads]
+    bad3 = [r["id"] for r in nonhead_open
+            if not (r["superseded_by"] or meta(r, "supersedes") or meta(r, "supplements"))]
+    emit("A3", not bad3,
+         f"{len(nonhead_open)} open non-head rows checked for typed out-edge "
+         f"(vocab: superseded_by|supersedes|supplements, per A5 parity); prose-only: {bad3}",
+         ran=bool(nonhead_open))
 
-# A6b typed supplement edges must point at the current head
-if supps and heads:
-    mis = [r["id"] for r in supps
-           if meta(r, "supplements") not in {h["id"] for h in heads}]
-    emit("A6b", not mis, f"{len(supps)} typed supplement edges checked vs head; bad: {mis}")
-else:
-    emit("A6b", False,
-         f"arm cannot run: typed supps={len(supps)}, heads={len(heads)} — "
-         f"vacuous-green is RED (receipt-or-fail); arms when replay ships typed edges",
-         ran=False)
+    # A4 validity-stamped chain rows must also carry typed superseded_by
+    stamped = [r for r in chain if not open_(r)]
+    bad4 = [r["id"] for r in stamped if not r["superseded_by"]]
+    emit("A4", not bad4,
+         f"{len(stamped)} stamped rows checked for superseded_by "
+         f"(idx_wm_context_global gates superseded_by IS NULL); still-query-live: {bad4}",
+         ran=True)  # runs with 0 stamped = pass only post-hygiene when none should exist
 
-# A7 contradiction adjudication must not sit unresolved
-c = db.execute("select count(*) n from conflicts "
-               "where resolution is null or resolution=''").fetchone()["n"]
-emit("A7", c == 0, f"unresolved conflicts rows: {c} (scales' own mechanism, "
-                   f"same hygiene pass per why's ruling)")
+    # A5 no dangling edges store-wide
+    edges = [(r["id"], t) for r in rows.values()
+             for t in (r["superseded_by"], meta(r, "supersedes"),
+                       meta(r, "supplements")) if t]
+    dangling = [f"{s}->{t}" for s, t in edges if t not in rows]
+    emit("A5", not dangling, f"{len(edges)} typed edges checked; dangling: {dangling}",
+         ran=bool(edges))
 
-reds = [a for a, ok in arms if not ok]
-print(f"SUMMARY chain={len(chain)} supps={len(supps)} heads={len(heads)} "
-      f"open_chain={sum(1 for r in chain if open_(r))} arms={len(arms)} red={len(reds)}")
-print("RESULT:", "PASS" if not reds else f"FAIL({len(reds)}) red-arms={reds}")
-sys.exit(1 if reds else 0)
+    # A6a prose-declared supplements are honest red until replayed
+    bad6a = [r["id"] for r in prose_supps]
+    emit("A6a", not bad6a,
+         f"{len(prose_supps)} prose-only supplement declarations found (typed "
+         f"metadata.supplements required; why's honest-red ruling): {bad6a}")
+
+    # A6b typed supplement edges must point at the current head
+    if supps and heads:
+        mis = [r["id"] for r in supps
+               if meta(r, "supplements") not in {h["id"] for h in heads}]
+        emit("A6b", not mis, f"{len(supps)} typed supplement edges checked vs head; bad: {mis}")
+    else:
+        emit("A6b", False,
+             f"arm cannot run: typed supps={len(supps)}, heads={len(heads)} — "
+             f"vacuous-green is RED (receipt-or-fail); arms when replay ships typed edges",
+             ran=False)
+
+    # A7 contradiction adjudication must not sit unresolved
+    c = read_unresolved_conflict_count(db)
+    emit("A7", c == 0, f"unresolved conflicts rows: {c} (scales' own mechanism, "
+                       f"same hygiene pass per why's ruling)")
+
+    reds = [a for a, ok in arms if not ok]
+    print(f"SUMMARY chain={len(chain)} supps={len(supps)} heads={len(heads)} "
+          f"open_chain={sum(1 for r in chain if open_(r))} arms={len(arms)} red={len(reds)}")
+    print("RESULT:", "PASS" if not reds else f"FAIL({len(reds)}) red-arms={reds}")
+    sys.exit(1 if reds else 0)
