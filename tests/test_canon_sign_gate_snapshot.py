@@ -14,6 +14,7 @@ Run: pytest tests/test_canon_sign_gate_snapshot.py
 import importlib.util
 import sqlite3
 from pathlib import Path
+from unittest import mock
 
 GATE_PATH = Path(__file__).with_name("canon_sign_head_test.py")
 
@@ -60,7 +61,13 @@ def _commit_conflict(path, conflict_id):
 
 
 def test_bare_import_of_the_gate_is_inert():
-    gate = _load_gate()
+    # Direct import-time proof, not just absence of leftover attributes: patch
+    # sqlite3.connect across the whole module exec (the gate references it as
+    # a module attribute, so the patch is on its real call path) and require
+    # zero calls. The attribute checks below stay as the second witness.
+    with mock.patch.object(sqlite3, "connect") as connect:
+        gate = _load_gate()
+    assert not connect.called, "gate called sqlite3.connect at import time"
     assert not hasattr(gate, "db"), "gate opened a database at import time"
     assert not hasattr(gate, "rows"), "gate ran its reads at import time"
 
