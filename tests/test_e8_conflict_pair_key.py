@@ -757,3 +757,56 @@ def test_cli_dry_run_fails_explicitly_on_nullable_pair_column(
     assert "would add index" not in captured.out
     assert "nullable" in captured.err
     assert _index_present(db_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Round 5 (CodeRabbit review on 34e94af0, 2026-09-28): the existing-index
+# path. The Round 4 gate refused nullable pair columns, but ran AFTER the
+# already-present-index early return — so a nullable table that already
+# carried the canonical index short-circuited to applied=True without the
+# schema ever being consulted. Same false green class: an index that
+# cannot constrain NULL keys is not honestly "already applied." The gate
+# now runs before ANY index is accepted; assert refusal in both modes.
+# ---------------------------------------------------------------------------
+
+
+def _nullable_bank_with_canonical_index(db_path: Path, nullable: str) -> Path:
+    """A Round 4 nullable-pair bank with the canonical index created on it.
+
+    SQLite builds the unique index happily over nullable columns — that
+    is exactly the trap: creation succeeds while enforcement is defeated.
+    """
+    bank = _nullable_pair_bank(db_path, nullable)
+    con = sqlite3.connect(str(bank))
+    con.execute(
+        f"CREATE UNIQUE INDEX {INDEX_NAME} "
+        "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
+    )
+    con.commit()
+    con.close()
+    return bank
+
+
+@pytest.mark.parametrize("column", ["fact_a_id", "fact_b_id"])
+def test_dry_run_refuses_canonical_index_on_nullable_table(tmp_path, column):
+    bank = _nullable_bank_with_canonical_index(tmp_path / "bank.db", column)
+
+    with pytest.raises(ConflictSchemaUnreadableError) as excinfo:
+        migrate_conflict_pair_key(bank, dry_run=True)
+
+    assert "nullable" in str(excinfo.value)
+    assert column in str(excinfo.value)
+
+
+@pytest.mark.parametrize("column", ["fact_a_id", "fact_b_id"])
+def test_real_run_refuses_canonical_index_on_nullable_table(tmp_path, column):
+    bank = _nullable_bank_with_canonical_index(tmp_path / "bank.db", column)
+
+    with pytest.raises(ConflictSchemaUnreadableError):
+        migrate_conflict_pair_key(bank)
+
+    # The refusal is metadata, not demolition: the foreign index object
+    # is left as found and no row moved. What E8 refuses is the claim,
+    # not the schema object it never owned.
+    assert _index_present(bank) is True
+    assert _row_count(bank) == 1

@@ -50,7 +50,10 @@ fully enforce is the same false green this module refuses everywhere
 else. Nullable is not cosmetic: SQLite unique indexes treat NULL keys as
 distinct, so NULL-bearing rows would re-grow the ledger under an index
 reported applied. The canonical core DDL declares both pair columns
-``NOT NULL`` — this refusal only ever names foreign schemas.
+``NOT NULL`` — this refusal only ever names foreign schemas. This schema
+check runs FIRST, before any same-named index is accepted: a canonical
+index already sitting on a nullable table is refused (reported applied
+would be false), not silently treated as an already-done no-op.
 """
 
 from __future__ import annotations
@@ -224,6 +227,9 @@ def migrate_conflict_pair_key(
     existing table that lacks the pair columns, or declares either one
     nullable, raises ConflictSchemaUnreadableError in EITHER mode — a
     dry run never promises an index the schema cannot fully enforce.
+    That schema gate runs before the existing-index check, so a
+    canonical index already sitting on an unreadable table is refused
+    rather than passing as an already-applied no-op.
     """
     report: MigrationReport = {
         "applied": False,
@@ -248,26 +254,16 @@ def migrate_conflict_pair_key(
             report["conflicts_table_missing"] = True
             return report  # type: ignore[return-value]
 
-        stored_ddl = _index_ddl(conn, _INDEX_NAME)
-        if stored_ddl is not None:
-            if not _ddl_equivalent(stored_ddl, _STORED_INDEX_DDL):
-                raise IndexDefinitionMismatchError(
-                    f"index '{_INDEX_NAME}' exists but does not enforce the "
-                    "order-normalized unique pair key; refusing to report E8 "
-                    f"as applied. stored: {stored_ddl.strip()!r}; "
-                    f"expected: {_STORED_INDEX_DDL!r}"
-                )
-            report["index_already_present"] = True
-            report["applied"] = True
-            return report  # type: ignore[return-value]
-
         # An existing table with an unreadable shape is NOT the
-        # missing-table case reported above. Missing pair columns: every
-        # E8 statement raises. Nullable pair columns: the index builds
-        # but cannot enforce (SQLite unique indexes treat NULL keys as
-        # distinct, so NULL-bearing rows slip it). Either way a dry run
-        # setting index_added/applied promises a constraint the schema
-        # defeats — refuse in both modes, explicitly, bank untouched.
+        # missing-table case reported above, and this gate runs BEFORE
+        # any index is accepted — whether E8 would create the index or
+        # finds one already present, ``applied=True`` over a schema the
+        # constraint cannot fully enforce is the same false green.
+        # Missing pair columns: every E8 statement raises. Nullable pair
+        # columns: the index builds (and could already exist) but cannot
+        # enforce — SQLite unique indexes treat NULL keys as distinct, so
+        # NULL-bearing rows slip it. Either way refuse explicitly, bank
+        # untouched, in both dry-run and real modes.
         columns = _conflicts_columns(conn)
         found = {name.casefold() for name, _ in columns}
         missing = [c for c in _REQUIRED_CONFLICT_COLUMNS if c not in found]
@@ -289,6 +285,19 @@ def migrate_conflict_pair_key(
                 "keys, so E8 cannot honestly report the normalized pair "
                 f"key as enforced; nullable: {', '.join(nullable)}"
             )
+
+        stored_ddl = _index_ddl(conn, _INDEX_NAME)
+        if stored_ddl is not None:
+            if not _ddl_equivalent(stored_ddl, _STORED_INDEX_DDL):
+                raise IndexDefinitionMismatchError(
+                    f"index '{_INDEX_NAME}' exists but does not enforce the "
+                    "order-normalized unique pair key; refusing to report E8 "
+                    f"as applied. stored: {stored_ddl.strip()!r}; "
+                    f"expected: {_STORED_INDEX_DDL!r}"
+                )
+            report["index_already_present"] = True
+            report["applied"] = True
+            return report  # type: ignore[return-value]
 
         duplicates = _duplicate_pairs(conn)
         if duplicates:
