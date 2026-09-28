@@ -41,6 +41,12 @@ Safe to re-run: an existing same-named index is VALIDATED against the
 canonical definition, and a matching one is a no-op. A same-named index
 carrying a DIFFERENT definition is an explicit failure
 (``IndexDefinitionMismatchError``) — never a reported success.
+
+An existing ``conflicts`` table that lacks the pair columns is likewise
+an explicit failure (``ConflictSchemaUnreadableError``), in real and dry
+runs alike: a dry run that promises ``index_added`` over a schema the
+constraint can never attach to is the same false green this module
+refuses everywhere else.
 """
 
 from __future__ import annotations
@@ -79,6 +85,19 @@ class IndexDefinitionMismatchError(RuntimeError):
     an index object this migration does not own is out of its authority.
     The message carries the stored and expected definitions; fix the
     named index, then re-run.
+    """
+
+
+class ConflictSchemaUnreadableError(RuntimeError):
+    """The ``conflicts`` table exists but cannot host the pair index.
+
+    The duplicate sweep and the index DDL both read ``fact_a_id`` and
+    ``fact_b_id``; against a table without them every E8 statement
+    raises ``sqlite3.OperationalError``. A dry run that reported
+    ``index_added`` here would predict a success the real pass cannot
+    deliver — the same false green as accepting an index by name alone.
+    Both modes therefore fail loudly, bank untouched. Repair the table,
+    then re-run.
     """
 
 # Normalized-pair predicate, reused for the pre-flight duplicate sweep.
@@ -122,6 +141,17 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+# The pair columns both the duplicate sweep and the index DDL read.
+# SQLite resolves column names case-insensitively, so the gate below
+# compares casefolded names: a differently-cased legacy table is still
+# indexable and must not be refused.
+_REQUIRED_CONFLICT_COLUMNS = ("fact_a_id", "fact_b_id")
+
+
+def _conflicts_columns(conn: sqlite3.Connection) -> List[str]:
+    return [row[1] for row in conn.execute("PRAGMA table_info(conflicts)")]
+
+
 def _index_ddl(conn: sqlite3.Connection, name: str) -> Union[str, None]:
     """Stored DDL text of a named index, or None when absent."""
     row = conn.execute(
@@ -146,11 +176,11 @@ def _ddl_equivalent(stored: str, canonical: str) -> bool:
 
 
 def _duplicate_pairs(conn: sqlite3.Connection) -> List[str]:
-    try:
-        rows = conn.execute(_DUPLICATE_PAIRS_SQL).fetchall()
-    except sqlite3.OperationalError:
-        # No conflicts table (or unreadable shape) — nothing to sweep.
-        return []
+    # The caller has verified the table exists AND exposes the pair
+    # columns, so an SQL failure here (lock, corruption) is NOT "no
+    # duplicates" — it propagates rather than masquerading as a clean
+    # sweep that green-lights the index.
+    rows = conn.execute(_DUPLICATE_PAIRS_SQL).fetchall()
     # Display form only; grouping already happened on the unambiguous
     # (lo, hi) expression pair.
     return [f"{r[0]}/{r[1]}" for r in rows]
@@ -176,7 +206,10 @@ def migrate_conflict_pair_key(
     when duplicate pairs make a unique index impossible today. A same-named
     existing index is validated against the canonical definition; a
     mismatch raises IndexDefinitionMismatchError (explicit failure, bank
-    untouched) rather than falsely reporting ``applied=True``.
+    untouched) rather than falsely reporting ``applied=True``. An existing
+    table that lacks the pair columns raises ConflictSchemaUnreadableError
+    in EITHER mode — a dry run never promises an index the schema cannot
+    host.
     """
     report: MigrationReport = {
         "applied": False,
@@ -213,6 +246,20 @@ def migrate_conflict_pair_key(
             report["index_already_present"] = True
             report["applied"] = True
             return report  # type: ignore[return-value]
+
+        # An existing table with an unreadable shape is NOT the
+        # missing-table case reported above: here every E8 statement
+        # raises. A dry run that sets index_added/applied over such a
+        # schema promises a constraint a real pass can never build —
+        # refuse in both modes, explicitly, bank untouched.
+        found = {c.casefold() for c in _conflicts_columns(conn)}
+        missing = [c for c in _REQUIRED_CONFLICT_COLUMNS if c not in found]
+        if missing:
+            raise ConflictSchemaUnreadableError(
+                "conflicts table exists but does not expose the pair "
+                f"columns E8 needs; missing: {', '.join(missing)}; found: "
+                f"{', '.join(sorted(found)) or '(no columns)'}"
+            )
 
         duplicates = _duplicate_pairs(conn)
         if duplicates:

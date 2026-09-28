@@ -33,6 +33,7 @@ from mnemosyne import cli
 from mnemosyne.core.banks import BankManager
 from mnemosyne.core.veracity_consolidation import VeracityConsolidator
 from mnemosyne.migrations.e8_conflict_pair_key import (
+    ConflictSchemaUnreadableError,
     IndexDefinitionMismatchError,
     migrate_conflict_pair_key,
 )
@@ -511,3 +512,130 @@ def test_cli_migrate_fails_explicitly_on_same_named_mismatch(
     assert "does not enforce the order-normalized unique pair key" in captured.err
     assert _row_count(db_path) == 1
     assert "min(" not in _stored_index_ddl(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (CodeRabbit review on 25edba72, 2026-09-28): an existing conflicts
+# table with an unreadable shape is NOT the missing-table case. The sweep
+# used to swallow the resulting OperationalError as "no duplicates", so the
+# DRY RUN reported index_added/applied over a schema a real pass could only
+# reject on the DDL. Both modes must now fail identically, bank untouched.
+# ---------------------------------------------------------------------------
+
+
+def _wrong_shape_conflicts_bank(db_path: Path) -> Path:
+    """Give the bank a `conflicts` table that lacks the pair columns.
+
+    Divergent-legacy shape: both the duplicate sweep and the index DDL
+    read fact_a_id/fact_b_id, so every statement E8 runs against this
+    bank raises OperationalError. There is no schema E8 can honestly
+    report success for here.
+    """
+    con = sqlite3.connect(str(db_path))
+    con.execute("CREATE TABLE conflicts (id INTEGER PRIMARY KEY, note TEXT)")
+    con.execute("INSERT INTO conflicts (note) VALUES ('legacy row')")
+    con.commit()
+    con.close()
+    return db_path
+
+
+def test_dry_run_refuses_unreadable_conflicts_schema(tmp_path):
+    bank = _wrong_shape_conflicts_bank(tmp_path / "bank.db")
+
+    with pytest.raises(ConflictSchemaUnreadableError) as excinfo:
+        migrate_conflict_pair_key(bank, dry_run=True)
+
+    # The message names both halves of the gap: what is missing, what was
+    # found — enough to repair the table without opening a sqlite shell.
+    assert "fact_a_id" in str(excinfo.value)
+    assert "note" in str(excinfo.value)
+    assert _index_present(bank) is False  # and nothing was written
+
+
+def test_real_run_refuses_unreadable_conflicts_schema_explicitly(tmp_path):
+    """Real mode already failed, but only as a raw OperationalError from
+    the DDL — two layers below its cause. Explicit, named, explained."""
+    bank = _wrong_shape_conflicts_bank(tmp_path / "bank.db")
+
+    with pytest.raises(ConflictSchemaUnreadableError):
+        migrate_conflict_pair_key(bank)
+
+    assert _index_present(bank) is False
+    con = sqlite3.connect(str(bank))
+    try:
+        assert con.execute("SELECT COUNT(*) FROM conflicts").fetchone()[0] == 1
+    finally:
+        con.close()
+
+
+def test_missing_table_still_reports_rather_than_raises(tmp_path):
+    """The distinction the review asked for: table ABSENT is an honest
+    report (nothing to index), table unreadable is an explicit failure.
+    They are never conflated in either mode."""
+    absent = tmp_path / "absent.db"
+    con = sqlite3.connect(str(absent))
+    con.execute("CREATE TABLE facts (id TEXT)")
+    con.commit()
+    con.close()
+
+    report = migrate_conflict_pair_key(absent, dry_run=True)
+    assert report["conflicts_table_missing"] is True
+    assert report["applied"] is False
+    assert report["index_added"] is False
+
+    present = _wrong_shape_conflicts_bank(tmp_path / "present.db")
+    with pytest.raises(ConflictSchemaUnreadableError):
+        migrate_conflict_pair_key(present, dry_run=True)
+
+
+def test_legacy_column_casing_is_not_a_refusal(tmp_path):
+    """SQLite column names are case-insensitive; the gate compares
+    casefolded, so a differently-cased canonical table is indexable and
+    must pass, not be refused as unreadable."""
+    con_db = tmp_path / "mixed.db"
+    con = sqlite3.connect(str(con_db))
+    con.execute(
+        "CREATE TABLE conflicts (id INTEGER PRIMARY KEY, "
+        "Fact_A_Id TEXT, Fact_B_Id TEXT, conflict_type TEXT)"
+    )
+    con.execute(
+        "INSERT INTO conflicts (Fact_A_Id, Fact_B_Id, conflict_type) "
+        "VALUES ('cf_a', 'cf_b', 'contradiction')"
+    )
+    con.commit()
+    con.close()
+
+    report = migrate_conflict_pair_key(con_db)
+    assert report["index_added"] is True
+    assert _index_present(con_db) is True
+
+
+def test_cli_dry_run_does_not_promise_index_on_unreadable_schema(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = _cli_bank(tmp_path, monkeypatch)  # drops the conflicts table
+    _wrong_shape_conflicts_bank(db_path)  # then seeds the divergent shape
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_migrate(["--dry-run"])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "would add index" not in captured.out
+    assert "does not expose the pair columns" in captured.err
+    assert _index_present(db_path) is False
+
+
+def test_cli_migrate_fails_explicitly_on_unreadable_schema(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = _cli_bank(tmp_path, monkeypatch)
+    _wrong_shape_conflicts_bank(db_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_migrate([])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "does not expose the pair columns" in captured.err
+    assert _index_present(db_path) is False

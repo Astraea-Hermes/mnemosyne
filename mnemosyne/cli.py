@@ -1850,6 +1850,7 @@ def cmd_migrate(args):
     from mnemosyne.core.banks import BankManager
     from mnemosyne.migrations.e7_311_tables import migrate_311_tables
     from mnemosyne.migrations.e8_conflict_pair_key import (
+        ConflictSchemaUnreadableError,
         IndexDefinitionMismatchError,
         migrate_conflict_pair_key,
     )
@@ -1888,7 +1889,10 @@ def cmd_migrate(args):
     # call the pair constraint was unreachable through `mnemosyne migrate`.
     try:
         e8_report = migrate_conflict_pair_key(db_path, dry_run=dry_run)
-    except IndexDefinitionMismatchError as e:
+    except (
+        IndexDefinitionMismatchError,
+        ConflictSchemaUnreadableError,
+    ) as e:
         _fail(f"migrate_failed: {e}", exit_code=1)
     except Exception:
         _fail("migrate_failed: e8", exit_code=1)
