@@ -37,7 +37,10 @@ and no row is deleted. If pre-existing duplicate pairs are found the index
 is NOT created (SQLite would fail) — the migration reports them and leaves
 the bank untouched for adjudication instead of guessing a winner.
 
-Safe to re-run (``CREATE UNIQUE INDEX IF NOT EXISTS`` + existence check).
+Safe to re-run: an existing same-named index is VALIDATED against the
+canonical definition, and a matching one is a no-op. A same-named index
+carrying a DIFFERENT definition is an explicit failure
+(``IndexDefinitionMismatchError``) — never a reported success.
 """
 
 from __future__ import annotations
@@ -55,6 +58,28 @@ _INDEX_DDL = (
     f"CREATE UNIQUE INDEX IF NOT EXISTS {_INDEX_NAME} "
     "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
 )
+
+# What SQLite stores in sqlite_master for _INDEX_DDL: the IF NOT EXISTS
+# clause is stripped from the stored text while the caller's whitespace
+# otherwise survives verbatim. Definition validation therefore compares
+# canonical token streams (punctuation split, whitespace collapsed,
+# casefolded) rather than raw text.
+_STORED_INDEX_DDL = (
+    f"CREATE UNIQUE INDEX {_INDEX_NAME} "
+    "ON conflicts (min(fact_a_id, fact_b_id), max(fact_a_id, fact_b_id))"
+)
+
+
+class IndexDefinitionMismatchError(RuntimeError):
+    """A same-named ``conflicts`` index enforces a different definition.
+
+    E8 refuses such a bank instead of accepting the name: reporting
+    ``applied=True`` over an index that does not enforce the normalized
+    pair key would be a false green, and silently dropping or shadowing
+    an index object this migration does not own is out of its authority.
+    The message carries the stored and expected definitions; fix the
+    named index, then re-run.
+    """
 
 # Normalized-pair predicate, reused for the pre-flight duplicate sweep.
 # Group by the two min/max ID EXPRESSIONS, not a slash-joined string: the
@@ -97,11 +122,27 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
-def _has_index(conn: sqlite3.Connection, name: str) -> bool:
+def _index_ddl(conn: sqlite3.Connection, name: str) -> Union[str, None]:
+    """Stored DDL text of a named index, or None when absent."""
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
     ).fetchone()
-    return row is not None
+    return row[0] if row is not None else None
+
+
+def _ddl_tokens(sql: str) -> str:
+    # Canonical token stream: split punctuation from its neighbours,
+    # collapse all whitespace, casefold. Two statements compare equal only
+    # when they index the same expressions in the same order — layout is
+    # free, meaning is not. Quoted/bracketed identifiers are NOT unquoted
+    # here; a name-shaped-but-different spelling is treated as a mismatch
+    # and fails loudly, which is the conservative direction.
+    spaced = sql.replace("(", " ( ").replace(")", " ) ").replace(",", " , ")
+    return " ".join(spaced.split()).casefold()
+
+
+def _ddl_equivalent(stored: str, canonical: str) -> bool:
+    return _ddl_tokens(stored) == _ddl_tokens(canonical)
 
 
 def _duplicate_pairs(conn: sqlite3.Connection) -> List[str]:
@@ -132,7 +173,10 @@ def migrate_conflict_pair_key(
 
     Idempotent; index-only; never writes or deletes a row. Returns a report
     instead of raising when the bank is not yet at the conflicts schema or
-    when duplicate pairs make a unique index impossible today.
+    when duplicate pairs make a unique index impossible today. A same-named
+    existing index is validated against the canonical definition; a
+    mismatch raises IndexDefinitionMismatchError (explicit failure, bank
+    untouched) rather than falsely reporting ``applied=True``.
     """
     report: MigrationReport = {
         "applied": False,
@@ -157,7 +201,15 @@ def migrate_conflict_pair_key(
             report["conflicts_table_missing"] = True
             return report  # type: ignore[return-value]
 
-        if _has_index(conn, _INDEX_NAME):
+        stored_ddl = _index_ddl(conn, _INDEX_NAME)
+        if stored_ddl is not None:
+            if not _ddl_equivalent(stored_ddl, _STORED_INDEX_DDL):
+                raise IndexDefinitionMismatchError(
+                    f"index '{_INDEX_NAME}' exists but does not enforce the "
+                    "order-normalized unique pair key; refusing to report E8 "
+                    f"as applied. stored: {stored_ddl.strip()!r}; "
+                    f"expected: {_STORED_INDEX_DDL!r}"
+                )
             report["index_already_present"] = True
             report["applied"] = True
             return report  # type: ignore[return-value]

@@ -29,8 +29,13 @@ from pathlib import Path
 
 import pytest
 
+from mnemosyne import cli
+from mnemosyne.core.banks import BankManager
 from mnemosyne.core.veracity_consolidation import VeracityConsolidator
-from mnemosyne.migrations.e8_conflict_pair_key import migrate_conflict_pair_key
+from mnemosyne.migrations.e8_conflict_pair_key import (
+    IndexDefinitionMismatchError,
+    migrate_conflict_pair_key,
+)
 
 INDEX_NAME = "idx_conflicts_pair_norm"
 
@@ -318,3 +323,191 @@ def test_dry_run_report_carries_discriminator_on_every_branch(tmp_path):
         assert report["dry_run"] is True, path
     # Real (non-dry) reports must not claim the discriminator.
     assert "dry_run" not in migrate_conflict_pair_key(dup)
+
+
+# ---------------------------------------------------------------------------
+# Round 2 (review, 2026-09-27): definition validation + CLI reachability.
+# ---------------------------------------------------------------------------
+
+
+def _wrong_same_named_index(db_path: Path) -> None:
+    """Drop an index under E8's name that enforces something ELSE.
+
+    A plain (non-unique) index on the raw columns is the realistic
+    lookalike: same name, no normalized-pair constraint. Accepting it by
+    name alone made the migration report a false success.
+    """
+    con = sqlite3.connect(str(db_path))
+    con.execute(
+        "CREATE INDEX idx_conflicts_pair_norm ON conflicts (fact_a_id, fact_b_id)"
+    )
+    con.commit()
+    con.close()
+
+
+def _stored_index_ddl(db_path: Path) -> str:
+    con = sqlite3.connect(str(db_path))
+    try:
+        return con.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (INDEX_NAME,),
+        ).fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_same_named_index_with_other_definition_fails_explicitly(tmp_path):
+    bank = _legacy_bank(tmp_path / "bank.db", [("cf_a", "cf_b", "contradiction")])
+    _wrong_same_named_index(bank)
+
+    with pytest.raises(IndexDefinitionMismatchError):
+        migrate_conflict_pair_key(bank)
+
+    # Explicit refusal, not a reported success — and the bank is left as
+    # found: the lookalike index untouched, no canonical one added, rows
+    # intact. Repairing a schema object E8 does not own is not E8's call.
+    assert "min(" not in _stored_index_ddl(bank)
+    assert _row_count(bank) == 1
+
+
+def test_same_named_index_mismatch_fails_explicitly_on_dry_run(tmp_path):
+    bank = _legacy_bank(tmp_path / "bank.db", [("cf_a", "cf_b", "contradiction")])
+    _wrong_same_named_index(bank)
+
+    with pytest.raises(IndexDefinitionMismatchError):
+        migrate_conflict_pair_key(bank, dry_run=True)
+
+    assert _row_count(bank) == 1
+
+
+def test_whitespace_variant_of_canonical_definition_is_a_validated_noop(tmp_path):
+    """Validation must compare WHAT is indexed, not HOW the DDL was typed:
+    the canonical statement written across several lines with stray spaces
+    is the same constraint and stays a no-op."""
+    bank = _legacy_bank(tmp_path / "bank.db", [("cf_a", "cf_b", "contradiction")])
+    con = sqlite3.connect(str(bank))
+    con.execute(
+        "CREATE UNIQUE INDEX idx_conflicts_pair_norm\n"
+        "            ON conflicts (  min(fact_a_id, fact_b_id),\n"
+        "                            max(fact_a_id, fact_b_id) )"
+    )
+    con.commit()
+    con.close()
+
+    report = migrate_conflict_pair_key(bank)
+
+    assert report["index_already_present"] is True
+    assert report["applied"] is True
+
+
+def _cli_bank(tmp_path, monkeypatch, rows=None):
+    """Bank on disk wired into the CLI module (mirrors the e7 CLI fixture
+    in tests/test_migration_dry_run_fingerprint.py). ``rows`` seeds the
+    legacy conflicts table without the index; None guarantees the table is
+    absent."""
+    data_dir = tmp_path / "data"
+    db_path = BankManager(data_dir).create_bank("e8bank")
+    con = sqlite3.connect(str(db_path))
+    con.execute(f"DROP INDEX IF EXISTS {INDEX_NAME}")
+    if rows is None:
+        con.execute("DROP TABLE IF EXISTS conflicts")
+    con.commit()
+    con.close()
+    if rows is not None:
+        _legacy_bank(db_path, rows)
+    monkeypatch.setattr(cli, "DATA_DIR", str(data_dir))
+    monkeypatch.setenv("MNEMOSYNE_BANK", "e8bank")
+    return db_path
+
+
+def test_cli_migrate_applies_e8_to_existing_bank(tmp_path, monkeypatch, capsys):
+    """The reviewer's gap: `mnemosyne migrate` on an existing bank must
+    actually deliver the pair constraint, and it must then ENFORCE."""
+    db_path = _cli_bank(
+        tmp_path,
+        monkeypatch,
+        rows=[("cf_a", "cf_b", "contradiction"), ("cf_d", "cf_c", "contradiction")],
+    )
+
+    cli.cmd_migrate([])
+
+    out = capsys.readouterr().out
+    assert "migrate e8 [APPLIED]" in out
+    assert "index added: idx_conflicts_pair_norm" in out
+    assert _index_present(db_path) is True
+    con = sqlite3.connect(str(db_path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type) "
+                "VALUES ('cf_b', 'cf_a', 'contradiction')"
+            )
+    finally:
+        con.close()
+
+
+def test_cli_migrate_reports_blocking_duplicates_and_fails(
+    tmp_path, monkeypatch, capsys
+):
+    """Duplicate pairs make the unique index impossible: the command names
+    the pairs, leaves rows untouched, and exits non-zero — 'migrate
+    succeeded' over an unapplied constraint is exactly the false green."""
+    db_path = _cli_bank(
+        tmp_path,
+        monkeypatch,
+        rows=[("cf_x", "cf_y", "contradiction"), ("cf_y", "cf_x", "contradiction")],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_migrate([])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "NOT APPLIED" in captured.out
+    assert "cf_x/cf_y" in captured.out
+    assert "migrate_incomplete" in captured.err
+    assert _index_present(db_path) is False
+    assert _row_count(db_path) == 2
+
+
+def test_cli_dry_run_reports_e8_without_writing(tmp_path, monkeypatch, capsys):
+    db_path = _cli_bank(tmp_path, monkeypatch, rows=[("cf_a", "cf_b", "contradiction")])
+
+    cli.cmd_migrate(["--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "migrate e8 [DRY RUN]" in out
+    assert "would add index: idx_conflicts_pair_norm" in out
+    assert _index_present(db_path) is False
+    assert _row_count(db_path) == 1
+
+
+def test_cli_migrate_skips_e8_when_conflicts_table_absent(
+    tmp_path, monkeypatch, capsys
+):
+    """A bank that never ran veracity consolidation has no conflicts table.
+    That is an honest 'nothing to index', not a failure, and must not
+    corrupt the E7 result the command already printed."""
+    db_path = _cli_bank(tmp_path, monkeypatch)
+
+    cli.cmd_migrate([])
+
+    out = capsys.readouterr().out
+    assert "conflicts table absent — nothing to index" in out
+    assert _index_present(db_path) is False
+
+
+def test_cli_migrate_fails_explicitly_on_same_named_mismatch(
+    tmp_path, monkeypatch, capsys
+):
+    db_path = _cli_bank(tmp_path, monkeypatch, rows=[("cf_a", "cf_b", "contradiction")])
+    _wrong_same_named_index(db_path)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_migrate([])
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "does not enforce the order-normalized unique pair key" in captured.err
+    assert _row_count(db_path) == 1
+    assert "min(" not in _stored_index_ddl(db_path)

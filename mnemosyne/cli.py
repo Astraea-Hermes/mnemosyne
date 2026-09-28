@@ -1816,11 +1816,17 @@ def cmd_config(args):
 
 
 def cmd_migrate(args):
-    """Add the 3.11.1 schema tables to an existing bank.
+    """Bring an existing bank up to the packaged schema.
 
-    Bank selection: ``--bank <name>`` flag, else ``$MNEMOSYNE_BANK``,
-    else the default bank. ``--dry-run`` reports pending DDL without
-    writing.
+    Applies the 3.11.1 tables (E7) and the order-normalized conflicts pair
+    key (E8), bank-scoped. Bank selection: ``--bank <name>`` flag, else
+    ``$MNEMOSYNE_BANK``, else the default bank. ``--dry-run`` reports
+    pending DDL without writing.
+
+    E8 is index-only. When pre-existing duplicate conflict pairs make the
+    unique index impossible, the pairs are reported and a real run exits
+    non-zero with the bank's rows untouched — choosing a winner per pair
+    is adjudication, not migration.
     """
     usage = "Usage: mnemosyne migrate [--bank <name>] [--dry-run]"
     bank_override = None
@@ -1843,6 +1849,10 @@ def cmd_migrate(args):
 
     from mnemosyne.core.banks import BankManager
     from mnemosyne.migrations.e7_311_tables import migrate_311_tables
+    from mnemosyne.migrations.e8_conflict_pair_key import (
+        IndexDefinitionMismatchError,
+        migrate_conflict_pair_key,
+    )
 
     bm = BankManager(Path(DATA_DIR))
     try:
@@ -1872,6 +1882,38 @@ def cmd_migrate(args):
             f"{', '.join(report['tables_already_present']) or '(none)'}"
         )
         print(f"  indices added: {report['indices_added']}")
+
+    # E8: order-normalized unique pair key on conflicts, bank-scoped.
+    # Existing banks only ever received the 311 tables above; without this
+    # call the pair constraint was unreachable through `mnemosyne migrate`.
+    try:
+        e8_report = migrate_conflict_pair_key(db_path, dry_run=dry_run)
+    except IndexDefinitionMismatchError as e:
+        _fail(f"migrate_failed: {e}", exit_code=1)
+    except Exception:
+        _fail("migrate_failed: e8", exit_code=1)
+
+    print(f"migrate e8 [{mode}]: bank={bank} db={db_path}")
+    if e8_report["conflicts_table_missing"]:
+        print("  conflicts table absent — nothing to index")
+    elif e8_report["index_already_present"]:
+        print("  index already present (definition validated): "
+              "idx_conflicts_pair_norm")
+    elif e8_report["duplicate_pairs"]:
+        pairs = e8_report["duplicate_pairs"]
+        print(
+            f"  NOT APPLIED — {len(pairs)} duplicate normalized pair(s) "
+            f"block the unique index: {', '.join(pairs)}"
+        )
+        print("  rows left untouched; adjudicate a winner per pair, "
+              "then re-run migrate")
+        if not dry_run:
+            _fail("migrate_incomplete: conflicts pair key (E8) not applied",
+                  exit_code=1)
+    elif dry_run:
+        print("  would add index: idx_conflicts_pair_norm")
+    else:
+        print("  index added: idx_conflicts_pair_norm")
 
 
 COMMANDS = {
