@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scales acceptance criterion — canon-sign chain head resolution. v5.
+"""Scales acceptance criterion — canon-sign chain head resolution. v6.
 Rides the re-host PR: runs GREEN only after keeper's (a) _handle_invalidate
 surface branch + (b) declared-edge replay land on the senses probe-chain-green build.
 
@@ -18,6 +18,13 @@ would flip the store PASS by contradicting the row's own recorded
 supersedes_nothing stance: changing the world to fit the measure. Only the
 form A6b already target-checks is admitted here; detection holes unchanged
 (prose-only supplements still RED via A6a; dangling still RED via A5).
+
+v5->v6 (CodeRabbit review 5330458141, 2026-09-27, major at line 45):
+working_memory (A0-A6) and conflicts (A7) now read inside ONE explicit
+SQLite read transaction. Two bare SELECTs each run in their own implicit
+read txn, so a concurrent gateway writer committing between them could
+be scored as a state combination that never existed in the store; BEGIN
+before the first read pins one snapshot for the whole gate.
 
 Design laws (rulings this encodes):
   - CHAIN membership: TRANSITIONAL anchor startswith (prose, labeled-for-
@@ -42,6 +49,7 @@ SUBJECT_REF = "multiplex-profile-memory-isolation.md"
 
 db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
 db.row_factory = sqlite3.Row
+db.execute("BEGIN")  # one read txn: working_memory (A0-A6) and conflicts (A7) share one snapshot
 rows = {r["id"]: r for r in db.execute(
     "select id, content, valid_until, superseded_by, metadata_json, created_at "
     "from working_memory")}
