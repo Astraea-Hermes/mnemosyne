@@ -48,7 +48,14 @@ and whether the caller may proceed with its own insert.
     Measured latency for a local read-only sqlite probe is ~0.23 ms, so the
     default carries ~400× headroom. Exceeding the cap is fail-closed, like any
     other probe failure; ``MNEMOSYNE_FEDERATION_TOTAL_BUDGET_MS`` moves or
-    removes it.
+    removes it (``0``/``none``/``off`` are the only ways to remove it).
+    Three corollaries the review round made explicit: the clock starts
+    BEFORE scope resolution and is rechecked after the last probe, because
+    the scope's own liveness reads retry and back off under the write lock;
+    the cap bounds SQLite lock waits too, not only VM work (a busy-wait is
+    not VM work and the progress handler never fires during one); and a
+    configured duration that is unparseable, non-finite or non-positive
+    raises instead of silently becoming the default.
 
 What this module deliberately is not
 ------------------------------------
@@ -78,6 +85,7 @@ offset — derived from ONE instant so a reader can check they agree.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -174,20 +182,42 @@ def _env_seconds(name: str, default_seconds: float) -> float:
 
     The ``*_MS`` suffix is the fleet's convention (``MNEMOSYNE_BUSY_TIMEOUT_MS``
     and the E8b census both follow it), so the unit is converted here rather
-    than left for a caller to misread. Non-numeric or non-positive values fall
-    back to the default with a warning — never to zero, which would mean
-    "instant timeout".
+    than left for a caller to misread.
+
+    Unset → the default. PRESENT but unparseable, non-finite or non-positive →
+    :class:`ValueError`: a configured value that cannot be honoured is a
+    configuration error, and substituting the default would hide a typo
+    behind a timeout that looks deliberate. Infinity especially is not "a
+    very large timeout" — it removes the deadline, and this knob has no
+    documented way to do that.
     """
     raw = os.environ.get(name)
     if raw is None:
         return default_seconds
+    return _finite_positive_ms(name, raw) / 1000.0
+
+
+def _finite_positive_ms(name: str, raw: str, *, hint: Optional[str] = None) -> float:
+    """Parse a configured millisecond duration, refusing unusable values.
+
+    Raises rather than defaulting (see :func:`_env_seconds`), and names the
+    offending ``var=value`` so the operator does not have to guess which
+    knob is wrong. ``hint`` lets the total budget's message mention its
+    unbounded sentinels, which the per-probe knob does not have.
+    """
+    expectation = hint or "a finite, positive number of milliseconds"
     try:
-        value = float(raw.strip()) / 1000.0
+        value = float(raw.strip())
     except ValueError:
-        logger.warning("federation handshake: %s=%r is not a number; using the %ss default",
-                       name, raw, default_seconds)
-        return default_seconds
-    return value if value > 0 else default_seconds
+        raise ValueError(f"{name}={raw!r} is invalid: expected {expectation}") from None
+    if not math.isfinite(value):
+        raise ValueError(
+            f"{name}={raw!r} is invalid: expected {expectation} — infinity "
+            f"removes the timeout instead of enlarging it"
+        )
+    if value <= 0:
+        raise ValueError(f"{name}={raw!r} is invalid: expected {expectation}")
+    return value
 
 
 def per_probe_timeout_seconds() -> float:
@@ -205,8 +235,12 @@ def total_budget_seconds() -> Optional[float]:
     Defaults to :data:`DEFAULT_TOTAL_BUDGET_S`, which bounds how long the
     probe can hold the home bank's write lock. ``MNEMOSYNE_FEDERATION_TOTAL_BUDGET_MS``
     overrides it: a positive number of milliseconds moves the cap, and ``0`` /
-    ``none`` / ``off`` removes it (v3's literal "unfixed" state). Exceeding
-    the cap is fail-closed, like any other probe failure.
+    ``none`` / ``off`` (or any other :data:`_UNBOUNDED` spelling) removes it —
+    that sentinel set is the ONLY sanctioned way to run unbounded, because it
+    is explicit and self-documenting. Any other present-but-unusable value
+    (garbage, ``inf``, ``nan``, a negative number) raises: it is a
+    configuration error, not a request for the default. Exceeding the cap is
+    fail-closed, like any other probe failure.
     """
     raw = os.environ.get(TOTAL_BUDGET_ENV)
     if raw is None:
@@ -214,13 +248,11 @@ def total_budget_seconds() -> Optional[float]:
     stripped = raw.strip().lower()
     if stripped in _UNBOUNDED:
         return None
-    try:
-        value = float(stripped) / 1000.0
-    except ValueError:
-        logger.warning("federation handshake: %s=%r is not a number; using the %ss default",
-                       TOTAL_BUDGET_ENV, raw, DEFAULT_TOTAL_BUDGET_S)
-        return DEFAULT_TOTAL_BUDGET_S
-    return value if value > 0 else None
+    return _finite_positive_ms(
+        TOTAL_BUDGET_ENV, raw,
+        hint=("a finite, positive number of milliseconds, or one of "
+              + "/".join(sorted(_UNBOUNDED - {""})) + " for an unbounded budget"),
+    ) / 1000.0
 
 
 def root_db_path(fleet_root: Path) -> Path:
@@ -467,15 +499,52 @@ def _failure(path: Path, exc: BaseException) -> Dict[str, Any]:
     }
 
 
-def _check_bank(path: Path) -> None:
+def _budget_failure(path: Optional[Path], budget_s: Optional[float]) -> Dict[str, Any]:
+    """The recorded failure for a probe that was not run inside its budget.
+
+    Surfaced with ``error_class='total_budget_exceeded'`` — the same class
+    the in-loop guard already used, so a reader sees one failure vocabulary
+    whether the budget ran out before scope, between probes, or after the
+    last probe finished.
+    """
+    return {
+        "probe_target": str(path) if path is not None else "",
+        "error_class": "total_budget_exceeded",
+        "error_message": (
+            f"total probe budget of {budget_s}s exceeded ({TOTAL_BUDGET_ENV})"
+        ),
+    }
+
+
+def _connect_timeout_seconds(limit_s: Optional[float]) -> float:
+    """SQLite busy-wait bound for one probe connection, in seconds.
+
+    ``sqlite3.connect``'s ``timeout`` is the OTHER half of the probe budget.
+    The progress handler aborts SQLite's virtual-machine work, but it is
+    never called while the engine waits for a lock, so without this knob the
+    connect silently keeps Python's 5 s default and a locked peer outlasts
+    any configured budget — per-probe or total — before retry handling runs.
+    Defaults to the per-probe budget when a caller does not clamp it.
+    """
+    if limit_s is None:
+        return DEFAULT_PER_PROBE_TIMEOUT_S
+    return max(0.0, limit_s)
+
+
+def _check_bank(path: Path, *, lock_timeout_s: Optional[float] = None) -> None:
     """Raise if ``path`` is not a readable bank.
 
     Same predicate the fleet census uses — holds a ``conflicts`` table —
     read through the same ``mode=ro`` URI, so this neither writes nor counts
     a non-bank. :class:`NotABank` is raised for "not a bank" (skip);
-    anything else propagates and R3 §(g) turns it into a refusal.
+    anything else propagates and R3 §(g) turns it into a refusal. The
+    connection's lock wait is bounded (:func:`_connect_timeout_seconds`)
+    rather than left at the engine default.
     """
-    connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    connection = sqlite3.connect(
+        f"{path.as_uri()}?mode=ro", uri=True,
+        timeout=_connect_timeout_seconds(lock_timeout_s),
+    )
     try:
         if not connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conflicts'"
@@ -491,6 +560,7 @@ def _check_bank_retrying(
     retries: int,
     backoff_s: float,
     sleep: Callable[[float], None],
+    lock_timeout_s: Optional[float] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """Decide whether ``path`` is a probeable bank, with R8's retry budget.
 
@@ -517,7 +587,7 @@ def _check_bank_retrying(
         return False, None
     for attempt in range(retries + 1):
         try:
-            _check_bank(path)
+            _check_bank(path, lock_timeout_s=lock_timeout_s)
             return True, None
         except NotABank:
             return False, None
@@ -537,6 +607,7 @@ def _probe_one(
     retries: int,
     backoff_s: float,
     sleep: Callable[[float], None],
+    lock_timeout_s: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Probe ONE bank for the pair. Returns ``(hits, failure_or_None)``.
 
@@ -544,16 +615,25 @@ def _probe_one(
     ``mode=ro`` URI, so the engine refuses writes even if this code tried.
     ``timeout_s`` is enforced with a progress handler — a query that outruns
     its budget is aborted by SQLite itself (``interrupted``), which
-    :func:`_classify_error` reports as ``timeout``. Bounded retries: one
-    retry after ``backoff_s``; beyond that the probe is a failure and the
-    upsert refuses (R3 §(g) / R8 §(c)).
+    :func:`_classify_error` reports as ``timeout``. That handler bounds VM
+    steps ONLY: the lock wait inside ``connect`` is bounded separately by
+    ``lock_timeout_s`` (clamped to ``timeout_s``), because a busy-wait is not
+    VM work and the progress handler is never called during one. Bounded
+    retries: one retry after ``backoff_s``; beyond that the probe is a
+    failure and the upsert refuses (R3 §(g) / R8 §(c)).
     """
+    lock_timeout = timeout_s if lock_timeout_s is None else min(timeout_s, max(0.0, lock_timeout_s))
     last_failure: Optional[Dict[str, Any]] = None
     for attempt in range(retries + 1):
         connection: Optional[sqlite3.Connection] = None
         try:
-            connection = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+            # The deadline covers the lock wait too: start it before connect
+            # so a 5-second default can never hide inside a 250 ms budget.
             deadline = time.monotonic() + timeout_s
+            connection = sqlite3.connect(
+                f"{bank.as_uri()}?mode=ro", uri=True,
+                timeout=_connect_timeout_seconds(lock_timeout),
+            )
 
             def _budget_exceeded() -> int:
                 return 1 if time.monotonic() > deadline else 0
@@ -611,6 +691,9 @@ def _probe_scope(
     retries: int = DEFAULT_RETRIES,
     backoff_s: float = DEFAULT_BACKOFF_S,
     sleep: Callable[[float], None] = time.sleep,
+    probe_timeout_s: float = DEFAULT_PER_PROBE_TIMEOUT_S,
+    deadline: Optional[float] = None,
+    total_budget_s: Optional[float] = None,
 ) -> Tuple[List[PeerSpec], List[Dict[str, Any]]]:
     """Return ``(ordered_peers, failures)`` for one upsert.
 
@@ -632,6 +715,14 @@ def _probe_scope(
 
     Order: shared (rank 0), root (rank 1), then every other non-shared bank
     in fleet-enumeration order. The upserting bank is never a peer.
+
+    The scope walk is INSIDE the caller's total budget (``deadline``): the
+    per-candidate liveness read retries and backs off exactly like a probe
+    does, so an unbounded scope pass could hold the home bank's write lock
+    for ``retries x backoff_s`` per candidate bank while the caller's clock
+    had not started yet. Past the deadline every remaining candidate is
+    recorded as ``total_budget_exceeded`` and skipped, so an overrun surfaces
+    as the same fail-closed refusal a probe failure produces.
     """
     home = _resolve(home_bank)
     surface = shared_db if shared_db is not None else (
@@ -655,9 +746,22 @@ def _probe_scope(
     seen: set = set()
 
     def _precheck(path: Path) -> bool:
-        """True when ``path`` should be probed; records any read failure."""
+        """True when ``path`` should be probed; records any read failure.
+
+        Budget-aware: past ``deadline`` the candidate is not probed at all
+        and a ``total_budget_exceeded`` failure is recorded instead, so the
+        scope walk cannot outrun the cap the caller started before calling
+        here. The lock wait is clamped to what is left of the budget, never
+        left at the engine's 5 s default.
+        """
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            failures.append(_budget_failure(path, total_budget_s))
+            return False
+        lock_timeout = probe_timeout_s if remaining is None else min(probe_timeout_s, remaining)
         should_probe, failure = _check_bank_retrying(
-            path, retries=retries, backoff_s=backoff_s, sleep=sleep)
+            path, retries=retries, backoff_s=backoff_s, sleep=sleep,
+            lock_timeout_s=lock_timeout)
         if failure is not None:
             failures.append(failure)
         return should_probe
@@ -666,9 +770,13 @@ def _probe_scope(
         key = str(path)
         if key in seen or path == home:
             return
+        # Mark the path decided BEFORE the precheck: a candidate that is
+        # skipped (not a bank, or out of budget) must not be re-decided when
+        # the same file turns up again in the candidate list, or a budget
+        # overrun would record one failure per duplicate spelling of it.
+        seen.add(key)
         if not _precheck(path):
             return
-        seen.add(key)
         ordered.append(PeerSpec(
             path=key,
             is_shared=surface is not None and key == str(surface),
@@ -746,13 +854,16 @@ def probe_fleet(
         shared_db, root_db: Explicit surface/root bank paths. Defaults
             mirror the census (:func:`fleet_census.shared_db_path`) and
             :func:`root_db_path`.
-        per_probe_timeout_s: R8 §(a) budget. Defaults to the env value
-            (:data:`PROBE_TIMEOUT_ENV`) or 250 ms.
+        per_probe_timeout_s: R8 §(a) budget, in seconds. Defaults to the env
+            value (:data:`PROBE_TIMEOUT_ENV`) or 250 ms. Must be finite and
+            positive; a configured value that is not raises ``ValueError``
+            rather than being silently replaced by a default.
         retries, backoff_s: R8 §(c) — 1 retry × 500 ms by default.
         total_budget_s: R8 §(b) cap. ``None`` uses the resolved default
             (:func:`total_budget_seconds`, 2 s unless overridden); a positive
-            value sets the cap; ``0`` or negative means unbounded, matching
-            the env convention.
+            number sets the cap; ``0`` or negative means unbounded, matching
+            the env convention (where ``0``/``none``/``off`` are the
+            documented sentinels). ``inf``/``nan`` raise.
         sleep: Injectable backoff sleep (tests pass a no-op).
 
     Returns:
@@ -761,11 +872,23 @@ def probe_fleet(
         the audit chain; ``decision.audit_events()`` is what to persist.
     """
     timeout_s = per_probe_timeout_s if per_probe_timeout_s is not None else per_probe_timeout_seconds()
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError(
+            f"per_probe_timeout_s={per_probe_timeout_s!r} is invalid: expected "
+            f"a finite, positive number of seconds"
+        )
     if total_budget_s is None:
         budget_s = total_budget_seconds()
+    elif not math.isfinite(total_budget_s):
+        raise ValueError(
+            f"total_budget_s={total_budget_s!r} is invalid: expected a finite "
+            f"number of seconds, or 0/negative for an unbounded sequence"
+        )
+    elif total_budget_s > 0:
+        budget_s = total_budget_s
     else:
         # 0/negative == unbounded, matching the env convention.
-        budget_s = total_budget_s if total_budget_s > 0 else None
+        budget_s = None
 
     # R2's key. The census owns normalization; reusing its function (rather
     # than re-spelling it) is what keeps this probe's key from drifting from
@@ -787,6 +910,14 @@ def probe_fleet(
         utc_offset_seconds=int(offset.total_seconds()) if offset else 0,
     )
 
+    # R8's clock starts HERE, before scope resolution: the scope's own
+    # liveness reads retry and back off, and they run while the home bank's
+    # write lock is held. Starting the clock after scope (as this did before)
+    # left that stretch unbudgeted, so a candidate set full of unreadable
+    # banks could hold the lock well past the cap the operator configured.
+    started = time.monotonic()
+    deadline = None if budget_s is None else started + budget_s
+
     peers, scope_failures = _probe_scope(
         home,
         fleet_root=root_resolved,
@@ -796,24 +927,24 @@ def probe_fleet(
         retries=retries,
         backoff_s=backoff_s,
         sleep=sleep,
+        probe_timeout_s=timeout_s,
+        deadline=deadline,
+        total_budget_s=budget_s,
     )
     decision.failed.extend(scope_failures)
     decision.refused = bool(scope_failures)
 
-    started = time.monotonic()
-    deadline = None if budget_s is None else started + budget_s
+    budget_exceeded_recorded = any(
+        failure.get("error_class") == "total_budget_exceeded"
+        for failure in decision.failed
+    )
     chain: List[Dict[str, Any]] = []
 
     for peer in peers:
-        if deadline is not None and time.monotonic() > deadline:
-            decision.failed.append({
-                "probe_target": peer.path,
-                "error_class": "total_budget_exceeded",
-                "error_message": (
-                    f"total probe budget of {budget_s}s exceeded before this probe "
-                    f"({TOTAL_BUDGET_ENV})"
-                ),
-            })
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            decision.failed.append(_budget_failure(Path(peer.path), budget_s))
+            budget_exceeded_recorded = True
             decision.refused = True
             continue
         hits, failure = _probe_one(
@@ -823,6 +954,7 @@ def probe_fleet(
             retries=retries,
             backoff_s=backoff_s,
             sleep=sleep,
+            lock_timeout_s=remaining,
         )
         decision.probes_run += 1
         decision.probed_banks.append(peer.path)
@@ -839,6 +971,18 @@ def probe_fleet(
 
     decision.elapsed_ms = (time.monotonic() - started) * 1000.0
     decision.chain = chain
+
+    # Recheck AFTER the loop. The pre-probe guard only asks whether a probe
+    # may START; a last probe that started inside the budget and finished
+    # past it would otherwise still report `proceed`, and the caller would
+    # insert a conflict row whose probe sequence overran R8's cap.
+    if (deadline is not None and not budget_exceeded_recorded
+            and time.monotonic() > deadline):
+        decision.failed.append(_budget_failure(
+            Path(decision.probed_banks[-1]) if decision.probed_banks else None,
+            budget_s,
+        ))
+        decision.refused = True
 
     if decision.refused:
         # Fail closed: no home insert, whatever the chain holds. The chain is

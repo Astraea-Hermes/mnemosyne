@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -100,6 +101,23 @@ def _make_bank(path: Path, rows=()) -> Path:
                 conn.execute(
                     "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type, resolution, created_at) "
                     "VALUES (?, ?, ?, ?, ?)", (a, b, kind, resolution, created))
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _make_bank_without_pair_columns(path: Path) -> Path:
+    """A bank whose ``conflicts`` table exists but has no pair columns.
+
+    Passes the bank predicate (``_check_bank`` only asks whether the table
+    exists) and fails the probe itself — the shape needed to exercise a probe
+    that starts and then takes real time, rather than being skipped at scope.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE conflicts (id INTEGER PRIMARY KEY)")
         conn.commit()
     finally:
         conn.close()
@@ -516,6 +534,102 @@ class TestFailClosed:
         assert decision.refused is False
         assert decision.probes_run == 3
 
+    def test_scope_resolution_runs_inside_the_total_budget(self, tmp_path):
+        """The clock starts BEFORE scope, so scope backoff is budgeted.
+
+        Scope decides bank liveness with the same retry/backoff budget a
+        probe uses, and it does so under the home bank's write lock. If the
+        deadline starts after scope returns, a candidate set full of
+        unreadable banks spends ``retries x backoff`` per bank outside the
+        cap the operator configured.
+        """
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        broken = self._broken_peer(fleet)
+        good = _profile(fleet, "beta")
+        _make_bank(good, [])
+
+        def _slow(_seconds: float) -> None:
+            time.sleep(0.3)
+
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
+            banks=[broken, good], total_budget_s=0.2, backoff_s=0.3,
+            sleep=_slow)
+
+        assert decision.refused is True
+        # The good bank sorts after the broken one; if scope were unbudgeted
+        # it would have been probed, spending more than the cap.
+        assert decision.probes_run == 0, decision.probed_banks
+        assert "total_budget_exceeded" in {f["error_class"] for f in decision.failed}
+
+    def test_a_last_probe_overrunning_the_budget_refuses_the_upsert(self, tmp_path):
+        """The deadline is rechecked AFTER the loop.
+
+        The pre-probe guard only asks whether a probe may START. A last probe
+        that started inside the budget and finished past it left ``proceed``
+        true, so the caller inserted a conflict row whose probe sequence had
+        overrun R8's cap.
+        """
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        slow_bank = _make_bank_without_pair_columns(fleet / "profiles" / "slow" / "mnemosyne.db")
+
+        def _slow(_seconds: float) -> None:
+            time.sleep(0.4)
+
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
+            banks=[slow_bank], per_probe_timeout_s=5.0, retries=1,
+            backoff_s=0.4, total_budget_s=0.3, sleep=_slow)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert "total_budget_exceeded" in {f["error_class"] for f in decision.failed}
+
+    def test_a_locked_peer_refuses_within_the_probe_budget(self, tmp_path):
+        """A held write lock must not outlast the probe budget.
+
+        The progress handler bounds SQLite's virtual-machine work only; a
+        busy-wait for a lock is not VM work and the handler is never called
+        during one, so Python's 5 s connect default used to be the real
+        bound on a locked peer regardless of the configured budget.
+        """
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        locked = _profile(fleet, "beta")
+        blocker = sqlite3.connect(str(locked))
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            started = time.monotonic()
+            decision = fh.probe_fleet(
+                PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
+                per_probe_timeout_s=0.05, retries=0, sleep=_noop_sleep)
+            elapsed = time.monotonic() - started
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert decision.refused is True
+        assert elapsed < 1.0, f"lock wait escaped the budget: {elapsed:.2f}s"
+        assert decision.proceed is False
+
+    def test_probe_one_bounds_its_own_connect_lock_wait(self, tmp_path):
+        """The same bound, asserted at the connection that owns it."""
+        locked = _make_bank(tmp_path / "locked" / "mnemosyne.db", [])
+        blocker = sqlite3.connect(str(locked))
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            started = time.monotonic()
+            hits, failure = fh._probe_one(
+                locked, PAIR, timeout_s=0.05, retries=0, backoff_s=0.0,
+                sleep=_noop_sleep)
+            elapsed = time.monotonic() - started
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        assert hits == []
+        assert failure is not None
+        assert elapsed < 1.0, f"lock wait escaped the per-probe budget: {elapsed:.2f}s"
+
     def test_per_probe_budget_defaults_to_250ms(self):
         assert fh.per_probe_timeout_seconds() == 0.25
 
@@ -527,10 +641,65 @@ class TestFailClosed:
         assert fh.per_probe_timeout_seconds() == 0.25
         monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, "50")
         assert fh.per_probe_timeout_seconds() == 0.05
-        monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, "0")
-        assert fh.per_probe_timeout_seconds() == fh.DEFAULT_PER_PROBE_TIMEOUT_S
         monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, "2500")
         assert fh.total_budget_seconds() == 2.5
+
+    def test_infinite_and_unusable_durations_are_refused(self, monkeypatch):
+        """Configured durations are validated, not coerced.
+
+        This replaces an earlier pin of the old semantics, where a
+        non-positive or non-numeric ``MNEMOSYNE_FEDERATION_PROBE_TIMEOUT_MS``
+        fell back to the default with a warning. That fallback hid typos,
+        and ``value > 0`` let ``inf`` through — an infinite per-probe
+        timeout removes the deadline entirely, and this knob has no
+        documented opt-out that says so.
+        """
+        for bad in ("inf", "-inf", "Infinity", "nan", "0", "-1", "", "250ms", "1e400"):
+            monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, bad)
+            with pytest.raises(ValueError) as excinfo:
+                fh.per_probe_timeout_seconds()
+            assert fh.PROBE_TIMEOUT_ENV in str(excinfo.value)
+            assert repr(bad) in str(excinfo.value)
+
+        # The total budget has unbounded SENTINELS ("0"/"none"/"off"/""), so
+        # its unusable set is the rest: garbage, non-finite, and negatives.
+        for bad in ("inf", "-inf", "Infinity", "nan", "-1", "250ms", "1e400"):
+            monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, bad)
+            with pytest.raises(ValueError) as excinfo:
+                fh.total_budget_seconds()
+            assert fh.TOTAL_BUDGET_ENV in str(excinfo.value)
+
+    def test_unbounded_sentinels_still_remove_the_total_cap(self, monkeypatch):
+        """The documented opt-out survives the validation tightening."""
+        for sentinel in ("0", "none", "off", "false", "unlimited", "unbounded", ""):
+            monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, sentinel)
+            assert fh.total_budget_seconds() is None, sentinel
+
+    def test_per_probe_has_no_unbounded_sentinel(self, monkeypatch):
+        """Only the TOTAL budget has a documented unbounded mode.
+
+        The per-probe timeout is the one that keeps a single locked peer from
+        stalling the sequence, so there is no spelling that removes it.
+        """
+        for sentinel in ("none", "off", "false", "unlimited", "unbounded"):
+            monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, sentinel)
+            with pytest.raises(ValueError):
+                fh.per_probe_timeout_seconds()
+
+    def test_probe_fleet_validates_its_duration_arguments(self, tmp_path):
+        home = _make_bank(tmp_path / "standalone" / "mnemosyne.db", [])
+        for bad in (float("inf"), float("nan"), 0, -1.0):
+            with pytest.raises(ValueError):
+                fh.probe_fleet(PAIR, home, per_probe_timeout_s=bad, sleep=_noop_sleep)
+        # The total cap has an unbounded spelling (0/negative); non-finite
+        # still raises, because it is neither a cap nor a documented opt-out.
+        for bad in (float("inf"), float("nan")):
+            with pytest.raises(ValueError):
+                fh.probe_fleet(PAIR, home, total_budget_s=bad, sleep=_noop_sleep)
+        for unbounded in (0, -1.0):
+            assert fh.probe_fleet(
+                PAIR, home, total_budget_s=unbounded, sleep=_noop_sleep
+            ).refused is False
 
 
 # ---------------------------------------------------------------------------
@@ -652,11 +821,11 @@ class TestUpsertPath:
         real = fh._check_bank
         state = {"calls": 0}
 
-        def flaky(path):
+        def flaky(path, **kwargs):
             state["calls"] += 1
             if state["calls"] == 1:
                 raise sqlite3.OperationalError("database is locked")
-            return real(path)
+            return real(path, **kwargs)
 
         monkeypatch.setattr(fh, "_check_bank", flaky)
         self._upsert_once(home)
