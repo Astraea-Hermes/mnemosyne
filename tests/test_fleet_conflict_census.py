@@ -182,6 +182,81 @@ class TestRootResolution:
 
 
 # --------------------------------------------------------------------------
+# 0b. Path identity — absolute, deduplicated, symlink-safe
+#
+# The bound is only as good as the identity behind "two banks". Two failure
+# shapes make that identity lie: a RELATIVE root or caller-supplied banks
+# reach ``Path.as_uri()`` inside the reader and raise ValueError, which is
+# not a ``sqlite3.Error`` — the whole census dies and the sleep result keeps
+# only ``{"error": ...}``, no bound. And a SYMLINKED ``.db`` under the root
+# is the same file under two names: counted as two holders it manufactures a
+# home↔home twin out of one bank. Census paths are resolved and deduped at
+# the entry point, so neither shape can reach the reader.
+# --------------------------------------------------------------------------
+
+class TestPathIdentity:
+
+    def test_relative_fleet_root_completes_the_census(self, tmp_path, monkeypatch):
+        """``MNEMOSYNE_FLEET_ROOT=./fleet`` must census, not explode."""
+        root = tmp_path / "fleet"
+        _build_fleet(root, {
+            "home-a": [_TWIN + (None,)],
+            "home-b": [(_TWIN[1], _TWIN[0], None)],
+        })
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(fleet_census.FLEET_ROOT_ENV, "fleet")
+        monkeypatch.delenv("MNEMOSYNE_SHARED_DB_PATH", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_HOME", raising=False)
+
+        report = fleet_census.census()
+
+        assert Path(report["root"]).is_absolute()
+        assert report["unreadable"] == []
+        assert report["banks_scanned"] == 2
+        # The planted twin is still found through a relative root — the fix
+        # must not merely survive, it must still measure the bound.
+        assert report["home_home_twin_count"] == 1, report
+        assert report["bound_holds"] is False
+
+    def test_relative_bank_paths_from_caller_are_resolved(self, tmp_path, monkeypatch):
+        """A caller may hand the census relative ``banks=`` paths."""
+        _build_fleet(tmp_path, {
+            "home-a": [_TWIN + (None,)],
+            "home-b": [(_TWIN[1], _TWIN[0], None)],
+        })
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(fleet_census.FLEET_ROOT_ENV, str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_SHARED_DB_PATH", raising=False)
+        monkeypatch.delenv("MNEMOSYNE_HOME", raising=False)
+
+        report = fleet_census.census(banks=[
+            Path("home-a/mnemosyne.db"),
+            Path("./home-b/../home-b/mnemosyne.db"),
+        ])
+
+        assert report["unreadable"] == []
+        assert report["banks_scanned"] == 2
+        assert report["home_home_twin_count"] == 1, report
+
+    def test_symlinked_bank_is_counted_once(self, fleet_env):
+        """One file behind two names is one holder, not a self-manufactured twin.
+
+        Without resolve-and-dedup, ``mirror.db`` (a symlink to the real
+        bank) is discovered as a second home bank holding the same pair, and
+        the bound trips on a fleet of one.
+        """
+        real = _make_bank(fleet_env / "home-a" / "mnemosyne.db", [_TWIN + (None,)])
+        link = real.parent / "mirror.db"
+        link.symlink_to(real)
+
+        report = fleet_census.census()
+
+        assert report["banks_scanned"] == 1, report
+        assert report["home_home_twin_count"] == 0, report
+        assert report["bound_holds"] is True
+
+
+# --------------------------------------------------------------------------
 # 1. The bound, both directions
 # --------------------------------------------------------------------------
 

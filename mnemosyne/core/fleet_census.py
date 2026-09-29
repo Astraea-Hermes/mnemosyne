@@ -216,6 +216,11 @@ def census(root: Optional[Path] = None, banks: Optional[List[Path]] = None) -> D
         banks: Explicit bank files, for callers (and tests) that already
             know the set and do not want the walk.
 
+    The root and every bank path are expanded and resolved to absolute,
+    deduplicated values before any bank is read: twins are keyed by file
+    identity, so a symlinked bank counts once and a relative path names
+    the same fleet as its absolute spelling.
+
     Returns:
         A JSON-serializable dict. The load-bearing key is
         ``home_home_twin_count`` / ``bound_holds``: the bound is
@@ -226,8 +231,15 @@ def census(root: Optional[Path] = None, banks: Optional[List[Path]] = None) -> D
         lists — the shared surface is not a home bank, so its presence
         never excuses two home banks holding the same pair).
     """
-    root_path = Path(root).expanduser() if root is not None else default_fleet_root()
-    bank_paths = list(banks) if banks is not None else discover_banks(root_path)
+    root_path = (Path(root).expanduser() if root is not None else default_fleet_root()).resolve()
+    raw_banks = list(banks) if banks is not None else discover_banks(root_path)
+    # Paths are the identity twins are keyed on, so normalize before
+    # reading: resolve() makes a relative root or caller-supplied relative
+    # banks absolute (``Path.as_uri()`` raises ValueError on relative
+    # paths — not a sqlite3.Error, and it would abort the whole census),
+    # and a symlinked bank collapses to the file it points at instead of
+    # counting as a second holder. Dedup + sort keep the walk deterministic.
+    bank_paths = sorted({Path(b).expanduser().resolve() for b in raw_banks})
     surface_path = shared_db_path(root_path)
     try:
         surface_resolved = surface_path.resolve()
