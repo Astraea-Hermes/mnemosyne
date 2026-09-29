@@ -28,6 +28,7 @@ import logging
 import sqlite3
 import json
 import threading
+import time
 import unicodedata
 from mnemosyne.core.journal import journal_mode
 from datetime import datetime
@@ -278,7 +279,21 @@ class VeracityConsolidator:
     - Our novel veracity-weighted Bayesian updating
     """
     
-    def __init__(self, db_path: Path = None, conn=None):
+    def __init__(self, db_path: Path = None, conn=None,
+                 federation_probe: Optional[bool] = None):
+        """Build a consolidator.
+
+        federation_probe: whether to run the cross-bank federation handshake
+            (policy v3 R3/R7/R8, see
+            :mod:`mnemosyne.core.federation_handshake`) BEFORE a conflict row
+            is written. ``None`` (default) follows
+            ``MNEMOSYNE_FEDERATION_HANDSHAKE``, which is on unless set falsy;
+            ``True``/``False`` pin it for this instance. The handshake is
+            scoped to the fleet that contains this consolidator's bank, so a
+            standalone bank (or a test's temp bank) has no peers and its
+            insert is unaffected. It never writes to a peer bank, and any
+            probe failure refuses the insert (fail-closed).
+        """
         if conn is not None:
             self.conn = conn
             self.db_path = db_path or Path(":memory:")
@@ -303,6 +318,13 @@ class VeracityConsolidator:
                 pass
         self.conn.row_factory = sqlite3.Row
         self._owns_connection = conn is None
+        # Federation handshake opt-in/out for this instance. Resolved lazily
+        # per conflict row (never frozen at construction) so an env change
+        # takes effect without rebuilding the consolidator, and so the
+        # fleet root is re-derived at call time -- policy v3 R3 §(e) makes
+        # the expanded probe permanent, so nothing here may be cached from
+        # a previous call.
+        self._federation_probe = federation_probe
 
         # Same-connection writer serialization. `BEGIN IMMEDIATE` provides
         # database-level serialization across CONNECTIONS, but two threads
@@ -568,6 +590,102 @@ class VeracityConsolidator:
                     veracity=veracity
                 )
 
+    def _federation_gate(self, fact_a_id: str, fact_b_id: str):
+        """Probe the fleet for this conflict pair before it is persisted.
+
+        Policy v3 R3 §(e)–(i), R7, R8 — the engineering handoff whose module
+        is :mod:`mnemosyne.core.federation_handshake`. Returns ``None`` when
+        the handshake is off or this bank is not in a fleet; otherwise a
+        :class:`~mnemosyne.core.federation_handshake.HandshakeDecision`
+        whose ``proceed`` decides whether the caller may write its row.
+
+        Enabled unless ``MNEMOSYNE_FEDERATION_HANDSHAKE`` is falsy or this
+        instance was built with ``federation_probe=False``. Nothing about the
+        probe scope is cached: R3 §(e) makes the expanded probe permanent, and
+        the fleet is re-enumerated at call time so the scope cannot drift from
+        the census's enumeration.
+        """
+        enabled = self._federation_probe
+        if enabled is not None and not enabled:
+            return None
+        if not self.db_path or str(self.db_path) == ":memory:":
+            return None
+        from mnemosyne.core import federation_handshake
+        if enabled is None and not federation_handshake.probe_enabled():
+            return None
+        return federation_handshake.probe_fleet(
+            (fact_a_id, fact_b_id), Path(self.db_path)
+        )
+
+    #: Same DDL the Hermes provider's audit log uses
+    #: (integrations/hermes/src/mnemosyne_hermes/audit.py) — the table is
+    #: meant to be co-located with the active bank, so this does not create a
+    #: competing schema. Created on first federated write only, which keeps a
+    #: bank that never federates at the schema it already had.
+    _AUDIT_TABLE_DDL = """
+        CREATE TABLE IF NOT EXISTS memory_audit_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            action TEXT NOT NULL,
+            memory_id TEXT,
+            bank TEXT,
+            scope TEXT,
+            profile TEXT,
+            session_id TEXT,
+            source_tool TEXT,
+            tokens_used INTEGER,
+            reason TEXT,
+            metadata_json TEXT
+        )
+    """
+
+    def _record_federation_audit(self, decision) -> None:
+        """Persist the handshake's audit rows. Best-effort, never raises.
+
+        R3 §(f) requires ONE entry per upsert carrying the full chain;
+        R3 §(g) requires one ``federation_probe_failed`` row per failed
+        probe. Both come from ``decision.audit_events()``, so the policy's
+        shape is defined in one place. An audit failure must not turn a
+        memory write into an error — the same rule the provider's audit log
+        follows — so this logs and returns.
+        """
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(self._AUDIT_TABLE_DDL)
+            for event in decision.audit_events():
+                metadata = event.get("metadata") or {}
+                reason = (
+                    "federated_to_" + str(metadata.get("federated_to"))
+                    if metadata.get("federated_to")
+                    else ("refused" if metadata.get("refused") else "proceeded")
+                )
+                cursor.execute(
+                    "INSERT INTO memory_audit_events "
+                    "(timestamp, action, memory_id, bank, scope, profile, "
+                    " session_id, source_tool, tokens_used, reason, metadata_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        time.time(),
+                        event["action"],
+                        None,
+                        decision.home_bank,
+                        None,
+                        None,
+                        None,
+                        "veracity_consolidator",
+                        None,
+                        reason,
+                        json.dumps(metadata),
+                    ),
+                )
+            if not self.conn.in_transaction:
+                self.conn.commit()
+        except Exception:
+            logger.warning(
+                "federation handshake: audit write failed for pair %s at %s",
+                decision.pair, decision.home_bank, exc_info=True,
+            )
+
     def _record_conflict(self, fact_a_id: str, fact_b_id: str,
                          conflict_type: str, commit: bool = True):
         """Record a conflict between two facts.
@@ -582,7 +700,28 @@ class VeracityConsolidator:
             allowing later conflict-record failures to leak partial
             state. /review (E2.a.5 4-source HIGH) caught this pattern
             in the inline version; preserved in the DRY refactor.
+
+        Federation gate (policy v3 R3, before the INSERT): the pair is probed
+            across the fleet. A holder elsewhere → the row is NOT written and
+            an audit entry names the canonical holder (R3 §(f), R7). Any
+            probe failure → the row is NOT written and a
+            ``federation_probe_failed`` row records it (R3 §(g), fail-closed).
+            No peers (standalone bank) → unchanged behaviour.
         """
+        decision = self._federation_gate(fact_a_id, fact_b_id)
+        if decision is not None:
+            self._record_federation_audit(decision)
+            if not decision.proceed:
+                logger.info(
+                    "federation handshake: skipping conflict row for pair %s at %s "
+                    "(federated_to=%s, refused=%s, chain=%d)",
+                    decision.pair, decision.home_bank, decision.federated_to,
+                    decision.refused, len(decision.chain),
+                )
+                # R3 §(f)/(g): the caller's transaction is NOT poisoned — the
+                # consolidated fact still commits; only this cross-bank
+                # duplicate is refused.
+                return
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type)

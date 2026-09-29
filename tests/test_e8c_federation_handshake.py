@@ -1,0 +1,693 @@
+"""Tests for E8c — the federation handshake in the upsert path.
+
+Policy ``policy:conflict-disposition-2026-09-26`` v3 (why seat), R3 §(e)–(i),
+R7, R8. The handshake exists because the v2 rule — "probe the shared surface
+only; home↔home twins are accepted scope" — was falsified by E8b's first live
+run: ONE home↔home twin held by FIVE non-shared banks, with an earlier
+label-keyed probe reporting 0 while it was live. So these tests pin:
+
+  1. probe SCOPE is the fleet census's own enumeration, in R7's order
+     (shared, root, then every other non-shared bank), never the upserting
+     bank — and the probe set equals the census's bank set, so scope cannot
+     drift from the bound the census maintains;
+  2. probe RESULTS accumulate into ONE chain and ONE audit entry per upsert
+     (not one entry per probe);
+  3. canonical preference is deterministic (shared > root > oldest profile);
+  4. a probe failure FAILS CLOSED: no home insert, and a
+     ``federation_probe_failed`` row naming the target;
+  5. the per-probe budget is 250 ms with 1 retry / 500 ms backoff, and the
+     total wall-clock cap is unset unless asked for;
+  6. probed banks are NOT written to (digest + mtime + schema + counts);
+  7. the gate is exercised from the real upsert path
+     (``VeracityConsolidator.consolidate_fact`` -> ``_record_conflict``), not
+     only by direct import.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from mnemosyne.core import federation_handshake as fh
+from mnemosyne.core import fleet_census
+from mnemosyne.core.veracity_consolidation import VeracityConsolidator, compute_fact_id
+
+# Canonical conflicts DDL, copied from the source of truth in
+# mnemosyne/core/veracity_consolidation.py. The handshake only READS this
+# table; the fixture owns creating it.
+_CONFLICTS_DDL = """
+CREATE TABLE IF NOT EXISTS conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_a_id TEXT NOT NULL,
+    fact_b_id TEXT NOT NULL,
+    conflict_type TEXT,
+    resolution TEXT,
+    resolved_at TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+# Deliberately NOT pre-sorted: the detector does not canonicalize orientation
+# (15 of 32 live rows violated fact_a_id < fact_b_id on 2026-09-26), so a
+# probe that compared raw (a, b) would miss the swapped occurrence — exactly
+# the failure the order-normalized key exists to prevent.
+PAIR = ("cf_zzz_twin", "cf_aaa_twin")
+
+SUBJECT, PREDICATE = "Astraea", "is"
+OBJECT_OLD, OBJECT_NEW = "researching", "continuous"
+
+#: The conflict pair the consolidation path actually produces: the detector
+#: records ``(new_id, existing_id)`` when the second object lands. Integration
+#: tests must plant THIS pair, not an arbitrary one, or they prove nothing.
+UPSERT_PAIR = (
+    compute_fact_id(SUBJECT, PREDICATE, OBJECT_NEW),
+    compute_fact_id(SUBJECT, PREDICATE, OBJECT_OLD),
+)
+
+
+def _noop_sleep(_seconds: float) -> None:
+    return None
+
+
+def _make_bank(path: Path, rows=()) -> Path:
+    """Create a bank holding a conflicts table.
+
+    rows: iterable of ``(fact_a_id, fact_b_id, resolution)`` or
+    ``(fact_a_id, fact_b_id, resolution, created_at)``. ``resolution`` None
+    means an OPEN conflict.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(_CONFLICTS_DDL)
+        payload = []
+        for row in rows:
+            if len(row) == 4:
+                payload.append((row[0], row[1], "contradiction", row[2], row[3]))
+            else:
+                payload.append((row[0], row[1], "contradiction", row[2], None))
+        for a, b, kind, resolution, created in payload:
+            if created is None:
+                conn.execute(
+                    "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type, resolution) "
+                    "VALUES (?, ?, ?, ?)", (a, b, kind, resolution))
+            else:
+                conn.execute(
+                    "INSERT INTO conflicts (fact_a_id, fact_b_id, conflict_type, resolution, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)", (a, b, kind, resolution, created))
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _shared(fleet: Path) -> Path:
+    return fleet / "mnemosyne" / "data" / "shared" / "mnemosyne.db"
+
+
+def _root_bank(fleet: Path) -> Path:
+    return fleet / "mnemosyne" / "data" / "mnemosyne.db"
+
+
+def _profile(fleet: Path, name: str) -> Path:
+    return fleet / "profiles" / name / "mnemosyne" / "data" / "mnemosyne.db"
+
+
+def _build_fleet(fleet: Path, *, shared_rows=(), root_rows=(), profiles=()) -> Path:
+    """Build a fleet in the layout the live bound was measured against."""
+    _make_bank(_shared(fleet), shared_rows)
+    _make_bank(_root_bank(fleet), root_rows)
+    for name, rows in profiles:
+        _make_bank(_profile(fleet, name), rows)
+    return fleet
+
+
+def _conflict_rows(bank: Path):
+    conn = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute("SELECT * FROM conflicts ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def _audit_rows(bank: Path):
+    conn = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM memory_audit_events ORDER BY event_id")]
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    for row in rows:
+        row["metadata"] = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+    return rows
+
+
+def _fingerprint(bank: Path) -> dict:
+    """Schema + counts + bytes + mtime, so a write anywhere shows up."""
+    conn = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    try:
+        tables = sorted(
+            row[0] for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL")
+        )
+        conflicts = conn.execute("SELECT COUNT(*) FROM conflicts").fetchone()[0]
+    finally:
+        conn.close()
+    stat = bank.stat()
+    digest = hashlib.sha256(bank.read_bytes()).hexdigest()
+    return {
+        "tables": tables,
+        "conflicts": conflicts,
+        "sha256": digest,
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+    }
+
+
+@pytest.fixture(autouse=True)
+def hermetic_env(monkeypatch):
+    """No ambient Mnemosyne config may reach these tests.
+
+    Unset means "derive the fleet root from the upserting bank", which is what
+    the integration cases exercise; an ambient override from the host would
+    silently point them at a different fleet.
+    """
+    for name in (
+        fleet_census.FLEET_ROOT_ENV,
+        "MNEMOSYNE_SHARED_DB_PATH",
+        "MNEMOSYNE_HOME",
+        fh.HANDSHAKE_ENV,
+        fh.PROBE_TIMEOUT_ENV,
+        fh.TOTAL_BUDGET_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 1. Probe scope — the census's enumeration, in R7's order (R3 §(e))
+# ---------------------------------------------------------------------------
+class TestProbeScope:
+
+    def test_probes_shared_rank0_root_rank1_then_every_other_bank(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[("alpha", ()), ("beta", ()), ("gamma", ())],
+        )
+        home = _profile(fleet, "alpha")
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet, sleep=_noop_sleep)
+
+        assert decision.probed_banks == [
+            str(_shared(fleet).resolve()),
+            str(_root_bank(fleet).resolve()),
+            str(_profile(fleet, "beta").resolve()),
+            str(_profile(fleet, "gamma").resolve()),
+        ]
+        assert str(home.resolve()) not in decision.probed_banks
+        assert decision.proceed is True
+
+    def test_probe_set_equals_the_census_bank_set(self, tmp_path):
+        """R3 §(e): v3 reuses the census enumeration so scope cannot drift."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            shared_rows=[PAIR + (None,)],
+            root_rows=[PAIR[::-1] + (None,)],
+            profiles=[("alpha", [PAIR + (None,)]), ("beta", ()), ("gamma", ())],
+        )
+        home = _profile(fleet, "alpha")
+        census = fleet_census.census(root=fleet)
+        census_banks = {entry["path"] for entry in census["banks"]}
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet, sleep=_noop_sleep)
+
+        assert set(decision.probed_banks) | {str(home.resolve())} == census_banks
+        # The chain's length equals the census's own holder count for the
+        # pair, over the surface+home twin set it reports.
+        twin = next(t for t in census["surface_home_twins"]
+                    if t["pair"] == sorted(PAIR))
+        assert len(decision.chain) == len(twin["banks"]) - 1  # minus the home bank
+
+    def test_standalone_bank_has_no_peers_and_inserts_anyway(self, tmp_path):
+        """The gate is on by default, but a bank outside a fleet has nothing
+        to probe — which is what makes default-on safe."""
+        home = _make_bank(tmp_path / "standalone" / "mnemosyne.db", [])
+
+        decision = fh.probe_fleet(PAIR, home, sleep=_noop_sleep)
+
+        assert decision.probed_banks == []
+        assert decision.chain == []
+        assert decision.proceed is True
+
+    def test_absent_shared_surface_and_root_bank_are_out_of_scope_not_failures(
+            self, tmp_path):
+        """A fleet with no shared surface and no root bank must not refuse.
+
+        Their paths are derived from the fleet root, so a fleet that simply
+        never created them would otherwise fail every insert closed. R3 §(e)
+        probes every LIVE bank; a path that is not a file is not live.
+        """
+        fleet = tmp_path / "fleet"
+        _make_bank(_profile(fleet, "alpha"), [])
+        _make_bank(_profile(fleet, "beta"), [])
+
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        assert decision.refused is False
+        assert decision.proceed is True
+        assert decision.probed_banks == [str(_profile(fleet, "beta").resolve())]
+
+
+# ---------------------------------------------------------------------------
+# 2. Chain accumulation and one audit entry per upsert (R3 §(f))
+# ---------------------------------------------------------------------------
+class TestChain:
+
+    def test_four_holders_produce_a_four_long_chain_and_one_audit_entry(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            shared_rows=[],
+            root_rows=[PAIR + (None,)],
+            profiles=[
+                ("alpha", ()),
+                ("beta", [PAIR[::-1] + (None,)]),
+                ("gamma", [PAIR + (None,)]),
+                # fourth holder, non-open (R7 counts closed holders too)
+                ("delta", [PAIR + ("superseded_by_x",)]),
+            ],
+        )
+        home = _profile(fleet, "alpha")
+
+        decision = fh.probe_fleet(PAIR, home, fleet_root=fleet, sleep=_noop_sleep)
+
+        assert len(decision.chain) == 4
+        assert decision.proceed is False
+        assert decision.federated is True
+        assert {entry["bank_path"] for entry in decision.chain} == {
+            str(_root_bank(fleet).resolve()),
+            str(_profile(fleet, "beta").resolve()),
+            str(_profile(fleet, "gamma").resolve()),
+            str(_profile(fleet, "delta").resolve()),
+        }
+        # Chain entries carry the policy's field names for both spellings
+        # (R3 §(f) says `resolution`, R7 §(d) says `resolution_status`).
+        for entry in decision.chain:
+            assert entry["resolution"] == entry["resolution_status"]
+            assert set(entry) >= {"id", "bank_path", "resolution_status", "created_at"}
+
+        events = decision.audit_events()
+        assert [e["action"] for e in events] == ["federation_probe"]
+        metadata = events[0]["metadata"]
+        assert len(metadata["federation_chain"]) == 4
+        assert metadata["chain_length"] == 4
+        assert metadata["canonical_preference"] == "shared > root > oldest profile (R7)"
+        assert metadata["proceeded"] is False
+        assert metadata["refused"] is False
+
+    def test_one_audit_entry_per_upsert_not_one_per_probe(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[("alpha", ()), ("beta", ()), ("gamma", ()), ("delta", ())],
+        )
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        assert decision.probes_run == 5  # shared, root, beta, gamma, delta
+        assert len(decision.audit_events()) == 1
+
+    def test_orientation_of_the_caller_pair_cannot_change_the_outcome(self, tmp_path):
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        _make_bank(_shared(fleet), [PAIR + (None,)])  # ensure surface holds it
+
+        forward = fh.probe_fleet(PAIR, _profile(fleet, "alpha"),
+                                 fleet_root=fleet, sleep=_noop_sleep)
+        reverse = fh.probe_fleet(PAIR[::-1], _profile(fleet, "alpha"),
+                                 fleet_root=fleet, sleep=_noop_sleep)
+
+        assert forward.pair == reverse.pair
+        assert forward.federated_to == reverse.federated_to
+
+
+# ---------------------------------------------------------------------------
+# 3. R7 canonical preference
+# ---------------------------------------------------------------------------
+class TestCanonicalPreference:
+
+    def test_shared_wins_over_root_and_profiles(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            shared_rows=[PAIR + (None,)],
+            root_rows=[PAIR + (None,)],
+            profiles=[("alpha", ()), ("beta", [PAIR + (None,)])],
+        )
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        shared_id = _conflict_rows(_shared(fleet))[0]["id"]
+        assert decision.federated_to == f"{shared_id}@{_shared(fleet).resolve()}"
+
+    def test_root_wins_when_shared_does_not_hold_it(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            shared_rows=[],
+            root_rows=[PAIR + (None,)],
+            profiles=[("alpha", ()), ("beta", [PAIR + (None,)])],
+        )
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        root_id = _conflict_rows(_root_bank(fleet))[0]["id"]
+        assert decision.federated_to == f"{root_id}@{_root_bank(fleet).resolve()}"
+
+    def test_oldest_profile_wins_by_created_at(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[
+                ("alpha", ()),
+                ("beta", [PAIR + (None, "2026-09-29 09:08:44")]),
+                ("gamma", [PAIR[::-1] + (None, "2026-09-29 09:52:45")]),
+            ],
+        )
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        beta_id = _conflict_rows(_profile(fleet, "beta"))[0]["id"]
+        assert decision.federated_to == f"{beta_id}@{_profile(fleet, 'beta').resolve()}"
+
+    def test_null_created_at_is_not_treated_as_oldest(self, tmp_path):
+        """Unknown age must not win canonicality over a known-older row."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[
+                ("alpha", ()),
+                ("beta", [PAIR + (None, "2026-09-29 09:08:44")]),
+                ("gamma", [PAIR + (None,)]),
+            ],
+        )
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        beta_id = _conflict_rows(_profile(fleet, "beta"))[0]["id"]
+        assert decision.federated_to == f"{beta_id}@{_profile(fleet, 'beta').resolve()}"
+
+
+# ---------------------------------------------------------------------------
+# 4. Fail-closed on probe failure (R3 §(g)) and the time budget (R8)
+# ---------------------------------------------------------------------------
+class TestFailClosed:
+
+    def _broken_peer(self, fleet: Path) -> Path:
+        """A non-empty ``*.db`` file that cannot be read as a database.
+
+        A *file* (not a directory) with non-sqlite bytes: the census walk
+        enumerates it, ``sqlite3`` opens it lazily, and the schema read then
+        raises ``DatabaseError('file is not a database')`` — a real probe
+        failure, which R3 §(g) makes a refusal.
+        """
+        broken = fleet / "profiles" / "broken" / "mnemosyne" / "data" / "mnemosyne.db"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_bytes(b"this is not a sqlite database\n")
+        return broken
+
+    def test_unreadable_peer_refuses_and_names_the_target(self, tmp_path):
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        broken = self._broken_peer(fleet)
+
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.proceed is False
+        assert [f["probe_target"] for f in decision.failed] == [str(broken.resolve())]
+        assert decision.failed[0]["error_class"]
+
+        failed_events = [e for e in decision.audit_events()
+                         if e["action"] == "federation_probe_failed"]
+        assert len(failed_events) == 1
+        metadata = failed_events[0]["metadata"]
+        assert metadata["probe_target"] == str(broken.resolve())
+        assert metadata["pair"] == sorted(PAIR)
+        assert metadata["upserting_bank"] == str(_profile(fleet, "alpha").resolve())
+
+    def test_retry_is_bounded_to_one_backoff_sleep(self, tmp_path):
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        self._broken_peer(fleet)
+        slept: list = []
+
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
+            backoff_s=0.5, sleep=slept.append)
+
+        assert decision.refused is True
+        assert slept == [0.5]
+
+    def test_refusal_wins_even_when_a_holder_was_already_found(self, tmp_path):
+        """A found holder does not excuse a failed probe (R3 §(g))."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            root_rows=[PAIR + (None,)],
+            profiles=[("alpha", ())],
+        )
+        self._broken_peer(fleet)
+
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.chain  # observed, reported, but not acted on
+        assert len(decision.chain) == 1
+
+    def test_probe_timeout_is_classified_as_timeout(self):
+        assert fh._classify_error(sqlite3.OperationalError("interrupted")) == "timeout"
+        assert fh._classify_error(TimeoutError("x")) == "timeout"
+
+    def test_total_budget_is_unset_by_default_and_hard_when_set(self, tmp_path):
+        assert fh.total_budget_seconds() is None
+
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
+            total_budget_s=1e-9, sleep=_noop_sleep)
+
+        assert decision.refused is True
+        assert decision.probes_run == 0
+        assert {f["error_class"] for f in decision.failed} == {"total_budget_exceeded"}
+        assert len(decision.failed) == 3  # shared, root, beta — all refused unfunded
+
+    def test_per_probe_budget_defaults_to_250ms(self):
+        assert fh.per_probe_timeout_seconds() == 0.25
+
+
+# ---------------------------------------------------------------------------
+# 5. Probed banks are never written to (same standard as E8b)
+# ---------------------------------------------------------------------------
+class TestNoWrites:
+
+    def test_probed_banks_are_byte_identical_after_a_federated_upsert(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            shared_rows=[UPSERT_PAIR + (None,)],
+            root_rows=[UPSERT_PAIR + (None,)],
+            profiles=[("alpha", ()), ("beta", [UPSERT_PAIR + (None,)])],
+        )
+        home = _profile(fleet, "alpha")
+        probed = [
+            _shared(fleet),
+            _root_bank(fleet),
+            _profile(fleet, "beta"),
+        ]
+        before = {str(p): _fingerprint(p) for p in probed}
+
+        # A real upsert through the consolidation path, not just a probe.
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_OLD, "stated", "s1")
+            consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_NEW, "stated", "s2")
+        finally:
+            consolidator.close()
+
+        after = {str(p): _fingerprint(p) for p in probed}
+        assert after == before
+        # And the home bank genuinely refused the row.
+        assert _conflict_rows(home) == []
+        assert len(_audit_rows(home)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. The upsert path itself (integration through consolidate_fact)
+# ---------------------------------------------------------------------------
+class TestUpsertPath:
+
+    def _upsert_once(self, bank: Path, pair_holder: bool = True) -> None:
+        consolidator = VeracityConsolidator(db_path=bank)
+        try:
+            consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_OLD, "stated", "s1")
+            consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_NEW, "stated", "s2")
+        finally:
+            consolidator.close()
+
+    def test_first_insert_grows_then_the_other_four_are_skipped(self, tmp_path):
+        """Criterion: 5 non-shared banks, one row total, four skips."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[("alpha", ()), ("beta", ()), ("gamma", ()), ("delta", ())],
+        )
+        banks = [
+            _root_bank(fleet),
+            _profile(fleet, "alpha"),
+            _profile(fleet, "beta"),
+            _profile(fleet, "gamma"),
+            _profile(fleet, "delta"),
+        ]
+        for bank in banks:
+            self._upsert_once(bank)
+
+        grown = [bank for bank in banks if _conflict_rows(bank)]
+        assert grown == [_root_bank(fleet)]  # first writer wins; R7(b) at root
+
+        pair = (compute_fact_id(SUBJECT, PREDICATE, OBJECT_NEW),
+                compute_fact_id(SUBJECT, PREDICATE, OBJECT_OLD))
+        key = fleet_census._norm_pair(*pair)
+
+        federated = []
+        for bank in banks[1:]:
+            audits = _audit_rows(bank)
+            probe_entries = [a for a in audits if a["action"] == "federation_probe"]
+            assert len(probe_entries) == 1
+            metadata = probe_entries[0]["metadata"]
+            assert metadata["pair"] == list(key)
+            assert metadata["federated_to"] is not None
+            assert metadata["proceeded"] is False
+            federated.append(metadata["federated_to"])
+
+        root_id = _conflict_rows(_root_bank(fleet))[0]["id"]
+        assert set(federated) == {f"{root_id}@{_root_bank(fleet).resolve()}"}
+        # One grown row in the whole fleet: the twin cannot form.
+        assert sum(len(_conflict_rows(b)) for b in banks) == 1
+
+    def test_probe_failure_writes_a_probe_failed_row_and_no_insert(self, tmp_path):
+        """Criterion (c): a failing peer refuses the home upsert."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[("alpha", ()), ("beta", ())],
+        )
+        broken = fleet / "profiles" / "broken" / "mnemosyne" / "data" / "mnemosyne.db"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_bytes(b"this is not a sqlite database\n")
+        home = _profile(fleet, "alpha")
+
+        self._upsert_once(home)
+
+        assert _conflict_rows(home) == []
+        audits = _audit_rows(home)
+        failed = [a for a in audits if a["action"] == "federation_probe_failed"]
+        assert [a["metadata"]["probe_target"] for a in failed] == [str(broken.resolve())]
+        probe = [a for a in audits if a["action"] == "federation_probe"]
+        assert len(probe) == 1
+        assert probe[0]["metadata"]["refused"] is True
+
+    def test_root_insert_grows_while_profiles_skip_and_name_root(self, tmp_path):
+        """Criterion (b): twin at root + 2 profiles -> root grows."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            profiles=[("alpha", ()), ("beta", ())],
+        )
+        self._upsert_once(_root_bank(fleet))
+        self._upsert_once(_profile(fleet, "alpha"))
+        self._upsert_once(_profile(fleet, "beta"))
+
+        assert len(_conflict_rows(_root_bank(fleet))) == 1
+        assert _conflict_rows(_profile(fleet, "alpha")) == []
+        assert _conflict_rows(_profile(fleet, "beta")) == []
+        root_id = _conflict_rows(_root_bank(fleet))[0]["id"]
+        expected = f"{root_id}@{_root_bank(fleet).resolve()}"
+        for name in ("alpha", "beta"):
+            metadata = _audit_rows(_profile(fleet, name))[0]["metadata"]
+            assert metadata["federated_to"] == expected
+            assert len(metadata["federation_chain"]) == 1
+
+    def test_shared_holder_is_preferred_from_the_upsert_path(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            shared_rows=[UPSERT_PAIR + (None,)],
+            root_rows=[UPSERT_PAIR + (None,)],
+            profiles=[("alpha", ())],
+        )
+        home = _profile(fleet, "alpha")
+        self._upsert_once(home)
+
+        assert _conflict_rows(home) == []
+        metadata = _audit_rows(home)[0]["metadata"]
+        shared_id = _conflict_rows(_shared(fleet))[0]["id"]
+        assert metadata["federated_to"] == f"{shared_id}@{_shared(fleet).resolve()}"
+        assert len(metadata["federation_chain"]) == 2  # shared + root, in rank order
+        assert metadata["federation_chain"][0]["is_shared"] is True
+
+    def test_env_opt_out_restores_legacy_behaviour(self, tmp_path, monkeypatch):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            root_rows=[UPSERT_PAIR + (None,)],
+            profiles=[("alpha", ())],
+        )
+        monkeypatch.setenv(fh.HANDSHAKE_ENV, "0")
+        home = _profile(fleet, "alpha")
+
+        self._upsert_once(home)
+
+        assert len(_conflict_rows(home)) == 1
+        assert _audit_rows(home) == []
+
+    def test_constructor_opt_out_restores_legacy_behaviour(self, tmp_path):
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            root_rows=[UPSERT_PAIR + (None,)],
+            profiles=[("alpha", ())],
+        )
+        home = _profile(fleet, "alpha")
+        consolidator = VeracityConsolidator(db_path=home, federation_probe=False)
+        try:
+            consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_OLD, "stated", "s1")
+            consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_NEW, "stated", "s2")
+        finally:
+            consolidator.close()
+
+        assert len(_conflict_rows(home)) == 1
+
+    def test_gate_runs_from_a_bank_whose_fleet_root_is_derived(self, tmp_path):
+        """No env, no explicit root: the bank's own location names the fleet."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            root_rows=[UPSERT_PAIR + (None,)],
+            profiles=[("alpha", ())],
+        )
+        home = _profile(fleet, "alpha")
+        assert fh.fleet_root_for_bank(home) == fleet.resolve()
+
+        self._upsert_once(home)
+
+        assert _conflict_rows(home) == []
+        assert _audit_rows(home)[0]["metadata"]["federated_to"]
+
+    def test_audit_stamp_carries_both_clocks(self, tmp_path):
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet, sleep=_noop_sleep)
+
+        local = datetime.fromisoformat(decision.read_at_local)
+        utc = datetime.fromisoformat(decision.read_at_utc)
+        assert decision.local_zone
+        assert (local - utc).total_seconds() == decision.utc_offset_seconds
+
+        metadata = decision.audit_events()[0]["metadata"]
+        for key in ("read_at_utc", "read_at_local", "local_zone", "utc_offset_seconds"):
+            assert key in metadata
