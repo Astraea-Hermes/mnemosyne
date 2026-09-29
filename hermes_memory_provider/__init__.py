@@ -3457,19 +3457,55 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         surface_content = self._surface_label(content, kind)
         stable_id = "sf_" + self._surface_hash(surface_content)
         meta = dict(metadata)
-        meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool", "source_profile_session": self._session_id})
+        # Parity with mnemosyne_hermes._handle_shared_remember (0.7.5): CLI one-shot
+        # and gateway lanes resolve 'mnemosyne' through different carrier families
+        # (entry-point scan vs the ~/.hermes/plugins symlink); without this block
+        # the same write lands shaped differently per lane — measured 2026-09-29
+        # when a keeper one-shot probe row arrived with no writer_profile at all
+        # while every gateway row carried one. The writer stamp belongs to the
+        # store, not to whichever import path woke up.
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            from hermes_constants import get_hermes_home
+            _wp = (get_active_profile_name() or "")
+            _wh = str(get_hermes_home())
+        except Exception:
+            _wp, _wh = "", ""
+        meta.update({"shared_memory": True, "surface_kind": kind, "write_path": "manual_tool",
+                     "source_profile_session": self._session_id,
+                     "writer_profile": _wp, "writer_home": _wh})
         existing_id = self._surface_beam._find_duplicate(surface_content)
-        memory_id = self._surface_beam.remember(
-            content=surface_content,
-            source="surface_manual",
-            importance=importance,
-            metadata=meta,
-            scope="global",
-            memory_id=stable_id,
-            veracity=veracity,
-            _write_policy=self._current_operation_write_policy(),
-            _write_policy_content=content,
-        )
+        _author_kwargs = {}
+        if _wp:
+            _author_kwargs = {"author_id": _wp, "author_type": "profile"}
+        try:
+            memory_id = self._surface_beam.remember(
+                content=surface_content,
+                source="surface_manual",
+                importance=importance,
+                metadata=meta,
+                scope="global",
+                memory_id=stable_id,
+                veracity=veracity,
+                _write_policy=self._current_operation_write_policy(),
+                _write_policy_content=content,
+                **_author_kwargs,
+            )
+        except TypeError as _te:
+            if "author_id" not in str(_te):
+                raise
+            meta["author_degraded"] = True
+            memory_id = self._surface_beam.remember(
+                content=surface_content,
+                source="surface_manual",
+                importance=importance,
+                metadata=meta,
+                scope="global",
+                memory_id=stable_id,
+                veracity=veracity,
+                _write_policy=self._current_operation_write_policy(),
+                _write_policy_content=content,
+            )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
         self._audit_event(
