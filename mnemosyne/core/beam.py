@@ -11568,8 +11568,19 @@ class BeamMemory:
         one: an unreadable fleet — or any census bug — must not turn a
         completed consolidation into an error, so failures are logged and
         recorded in the result instead of raised.
+
+        Two independent opt-outs, both resolved at call time:
+        ``enabled`` (the private ``_fleet_census`` flag, which
+        ``sleep_all_sessions`` uses to take the census once per pass instead
+        of once per session) and ``MNEMOSYNE_FLEET_CENSUS`` set falsy, which
+        stops the full-fleet walk entirely — ``sleep()`` may run often and
+        the walk's cost tracks the size of the tree, so an operator needs a
+        switch that does not require a code change.
         """
         if not enabled:
+            return result
+        from mnemosyne.core import fleet_census
+        if not fleet_census.census_enabled():
             return result
         try:
             result["fleet_conflict_census"] = self.fleet_conflict_census()

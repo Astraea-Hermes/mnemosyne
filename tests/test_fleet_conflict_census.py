@@ -87,6 +87,7 @@ def fleet_env(tmp_path, monkeypatch):
     # away from the fixture and make these tests host-dependent.
     monkeypatch.delenv("MNEMOSYNE_SHARED_DB_PATH", raising=False)
     monkeypatch.delenv("MNEMOSYNE_HOME", raising=False)
+    monkeypatch.delenv("MNEMOSYNE_FLEET_CENSUS", raising=False)
     return root
 
 
@@ -482,6 +483,21 @@ class TestReadOnly:
         assert report["banks_scanned"] == 1
         assert len(report["unreadable"]) == 1, report
         assert report["unreadable"][0]["path"] == str(garbage)
+        # Fail closed on partial data: the bound is UNMEASURED, not held.
+        # Reading bound_holds=True here would report a maintained bound on a
+        # census that could not see one of its banks.
+        assert report["bound_holds"] is False, report
+
+    def test_bound_holds_true_on_a_fully_readable_fleet_with_no_twins(self, fleet_env):
+        """The carve-out the rule above must not swallow: a complete read
+        with no home↔home twin reports the bound as holding."""
+        _build_fleet(fleet_env, {"home-a": [_TWIN + (None,)]})
+
+        report = fleet_census.census()
+
+        assert report["unreadable"] == []
+        assert report["home_home_twin_count"] == 0
+        assert report["bound_holds"] is True, report
 
     def test_non_bank_db_is_not_counted(self, fleet_env):
         _build_fleet(fleet_env, {"home-a": [_TWIN + (None,)]})
@@ -626,3 +642,66 @@ class TestSleepPath:
 
         assert result["status"] == "dry_run"
         assert result["fleet_conflict_census"] == {"error": "RuntimeError"}
+
+    def test_env_opt_out_skips_the_walk(self, fleet_env, beam_db, monkeypatch):
+        """``MNEMOSYNE_FLEET_CENSUS=0`` must stop the full-fleet walk.
+
+        ``sleep()`` runs on every pass and the walk's cost tracks the size of
+        the tree, so an operator needs a switch that does not require a code
+        change. The switch is read at CALL time: a sleep pass that cached it
+        would keep walking after the operator turned it off.
+        """
+        _build_fleet(fleet_env, {"home-a": [_TWIN + (None,)]})
+        beam = BeamMemory(session_id="s1", db_path=beam_db)
+        _seed_old_wm(beam_db, "s1", n=2)
+
+        def _boom(root=None, banks=None):
+            raise AssertionError("census walk ran despite the env opt-out")
+
+        monkeypatch.setattr(fleet_census, "census", _boom)
+
+        # On by default: the same beam, the same fixture, walks the fleet.
+        assert fleet_census.census_enabled() is True
+        monkeypatch.setenv(fleet_census.CENSUS_ENV, "0")
+        result = beam.sleep(dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert "fleet_conflict_census" not in result, result
+
+        # And back on again without a restart — resolved per call.
+        monkeypatch.setenv(fleet_census.CENSUS_ENV, "1")
+        assert fleet_census.census_enabled() is True
+
+    def test_env_opt_out_also_applies_to_sleep_all_sessions(
+            self, fleet_env, beam_db, monkeypatch):
+        _build_fleet(fleet_env, {"home-a": [_TWIN + (None,)]})
+        beam = BeamMemory(session_id="s1", db_path=beam_db)
+        _seed_old_wm(beam_db, "s1", n=2)
+        monkeypatch.setenv(fleet_census.CENSUS_ENV, "off")
+
+        result = beam.sleep_all_sessions(dry_run=True)
+
+        assert "fleet_conflict_census" not in result, result
+
+
+# --------------------------------------------------------------------------
+# 5. The env opt-out's own semantics
+# --------------------------------------------------------------------------
+
+class TestCensusEnabled:
+
+    @pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", " off "])
+    def test_falsy_values_disable(self, value, monkeypatch):
+        monkeypatch.setenv(fleet_census.CENSUS_ENV, value)
+        assert fleet_census.census_enabled() is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on", "maybe", ""])
+    def test_anything_else_stays_on(self, value, monkeypatch):
+        """The default must be ON: the census is what keeps R6's bound
+        measured, so only an explicit off-switch may stop it."""
+        monkeypatch.setenv(fleet_census.CENSUS_ENV, value)
+        assert fleet_census.census_enabled() is True
+
+    def test_unset_means_on(self, monkeypatch):
+        monkeypatch.delenv(fleet_census.CENSUS_ENV, raising=False)
+        assert fleet_census.census_enabled() is True
