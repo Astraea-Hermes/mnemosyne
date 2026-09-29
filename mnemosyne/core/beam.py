@@ -11542,7 +11542,47 @@ class BeamMemory:
             "candidate_ids": candidate_ids,
         }
 
-    def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
+    def fleet_conflict_census(self) -> Dict:
+        """Read-only census of conflict rows across every bank in the fleet.
+
+        Wraps :func:`mnemosyne.core.fleet_census.census`, which walks the
+        fleet root and reports, per bank holding a ``conflicts`` table, the
+        open-conflict count and the order-normalized pair set, cross-joins
+        those pairs across banks, and flags any normalized pair held by two
+        or more NON-shared banks as a home↔home twin. That count is the
+        accepted-scope bound the disposition policy is stated against, so it
+        is recomputed rather than inherited.
+
+        Discovery only: no writes, no dedup, no LLM, and a bank that cannot
+        be read is reported under ``unreadable`` instead of raising.
+        """
+        from mnemosyne.core import fleet_census
+        return fleet_census.census()
+
+    def _attach_fleet_conflict_census(self, result: Dict, enabled: bool = True) -> Dict:
+        """Attach the fleet census to a sleep result (never fails the sleep).
+
+        The census sits on the sleep-time path because the bound it reports
+        is supposed to be recomputed at every sleep pass. But it is a
+        diagnostic reading OTHER banks, not a consolidation step for this
+        one: an unreadable fleet — or any census bug — must not turn a
+        completed consolidation into an error, so failures are logged and
+        recorded in the result instead of raised.
+        """
+        if not enabled:
+            return result
+        try:
+            result["fleet_conflict_census"] = self.fleet_conflict_census()
+        except Exception as exc:
+            logger.warning(
+                "fleet conflict census failed (%s); sleep result unaffected",
+                type(exc).__name__,
+            )
+            result["fleet_conflict_census"] = {"error": type(exc).__name__}
+        return result
+
+    def sleep(self, dry_run: bool = False, force: bool = False,
+              _fleet_census: bool = True) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -11559,6 +11599,16 @@ class BeamMemory:
 
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories immediately regardless of age.
+
+        Post-E8b (additive): every sleep pass also emits
+        ``fleet_conflict_census`` — a read-only cross-bank census of conflict
+        rows (see :mod:`mnemosyne.core.fleet_census`) recomputed here rather
+        than inherited, because the disposition policy's accepted-scope bound
+        is stated against it and an asserted bound decays. It runs on the
+        no-op paths too: a pass with nothing to consolidate still owes the
+        bound. ``_fleet_census=False`` is a private opt-out for
+        sleep_all_sessions, which runs this method once per session and
+        therefore takes the census once for the whole pass instead of N times.
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
@@ -11666,7 +11716,9 @@ class BeamMemory:
                         "are exempt from consolidation (import quarantine); "
                         "re-date or unpin via update_working"
                     )
-            return result
+            # The bound is recomputed on the no-op path too: a pass with
+            # nothing to consolidate still ran a sleep.
+            return self._attach_fleet_conflict_census(result, _fleet_census)
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
         # episodic summary, gated on consolidated_at IS STILL NULL.
@@ -11708,14 +11760,15 @@ class BeamMemory:
                 claimed_ids = {r["id"] for r in cursor.fetchall()}
 
             if not claimed_ids:
-                # Lost the race entirely.
+                # Lost the race entirely. Close the connection, then still
+                # report the fleet bound: this pass ran, even if it did no work.
                 self.conn.commit()
-                return {
-            "status": "no_op",
-            "message": "All eligible rows claimed by concurrent sleep",
-            "conflicts_resolved": 0,
-            "conflicts_detected_only": 0,
-        }
+                return self._attach_fleet_conflict_census({
+                    "status": "no_op",
+                    "message": "All eligible rows claimed by concurrent sleep",
+                    "conflicts_resolved": 0,
+                    "conflicts_detected_only": 0,
+                }, _fleet_census)
 
             # Filter rows to only those we successfully claimed.
             rows = [r for r in rows if r["id"] in claimed_ids]
@@ -12146,7 +12199,7 @@ class BeamMemory:
             llm_used_count > 0, method,
         )
 
-        return {
+        result = {
             "status": "dry_run" if dry_run else "consolidated",
             "items_consolidated": len(consolidated_ids),
             "summaries_created": summaries_created,
@@ -12161,6 +12214,7 @@ class BeamMemory:
                 "applied": model_refresh_applied,
             }
         }
+        return self._attach_fleet_conflict_census(result, _fleet_census)
 
     def sleep_all_sessions(self, dry_run: bool = False, force: bool = False) -> Dict:
         """
@@ -12195,7 +12249,7 @@ class BeamMemory:
         """, (cutoff,))
         session_rows = cursor.fetchall()
         if not session_rows:
-            return {
+            return self._attach_fleet_conflict_census({
                 "status": "no_op",
                 "message": "No old working memories to consolidate",
                 "conflicts_resolved": 0,
@@ -12208,7 +12262,7 @@ class BeamMemory:
                 "errors": 0,
                 "model_refresh": {"proposals": 0, "applied": 0},
                 "session_results": [],
-            }
+            })
 
         session_results = []
         sessions_consolidated = 0
@@ -12244,7 +12298,7 @@ class BeamMemory:
                     author_id=self.author_id,
                     author_type=self.author_type,
                 )
-                result = beam.sleep(dry_run=dry_run, force=force)
+                result = beam.sleep(dry_run=dry_run, force=force, _fleet_census=False)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]
@@ -12274,7 +12328,7 @@ class BeamMemory:
         if not dry_run:
             self._deduplicate_memoria_cross_session()
 
-        return {
+        result = {
             "status": "dry_run" if dry_run else ("consolidated" if items_consolidated else "no_op"),
             "sessions_scanned": len(session_rows),
             "sessions_consolidated": sessions_consolidated,
@@ -12292,6 +12346,9 @@ class BeamMemory:
             "session_results": session_results,
             "degradation": degrade_result
         }
+        # One census for the whole maintenance pass: the per-session
+        # beam.sleep() calls above ran with _fleet_census=False.
+        return self._attach_fleet_conflict_census(result)
 
     def get_consolidation_log(self, limit: int = 10) -> List[Dict]:
         cursor = self.conn.cursor()
