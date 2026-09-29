@@ -220,7 +220,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 
 logger = logging.getLogger(__name__)
 
@@ -3333,17 +3333,44 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                      "source_profile_session": self._session_id,
                      "writer_profile": _wp, "writer_home": _wh})
         existing_id = self._surface_beam._find_duplicate(surface_content)
-        memory_id = self._surface_beam.remember(
-            content=surface_content,
-            source="surface_manual",
-            importance=importance,
-            metadata=meta,
-            scope="global",
-            memory_id=stable_id,
-            veracity=veracity,
-            _write_policy=self._current_operation_write_policy(),
-            _write_policy_content=content,
-        )
+        _author_kwargs = {}
+        if _wp:
+            # Promote the writer stamp into the queryable typed columns — the
+            # census found writer_profile in metadata on 152/209 rows while
+            # author_id stayed NULL on all of them (stamps existed, columns
+            # were never fed). Same bytes, two homes; the column is what
+            # recall filters and the one-witness audit can read.
+            _author_kwargs = {"author_id": _wp, "author_type": "profile"}
+        try:
+            memory_id = self._surface_beam.remember(
+                content=surface_content,
+                source="surface_manual",
+                importance=importance,
+                metadata=meta,
+                scope="global",
+                memory_id=stable_id,
+                veracity=veracity,
+                _write_policy=self._current_operation_write_policy(),
+                _write_policy_content=content,
+                **_author_kwargs,
+            )
+        except TypeError as _te:
+            # author kwargs unsupported by an older installed store (same
+            # skew class as the writer_degraded fallback): degrade, disclose.
+            if "author_id" not in str(_te):
+                raise
+            meta["author_degraded"] = True
+            memory_id = self._surface_beam.remember(
+                content=surface_content,
+                source="surface_manual",
+                importance=importance,
+                metadata=meta,
+                scope="global",
+                memory_id=stable_id,
+                veracity=veracity,
+                _write_policy=self._current_operation_write_policy(),
+                _write_policy_content=content,
+            )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
         self._audit_event(
