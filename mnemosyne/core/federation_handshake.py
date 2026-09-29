@@ -40,12 +40,15 @@ and whether the caller may proceed with its own insert.
     class the whole policy exists to close.
   - **R7 canonical preference.** shared > root > oldest profile, chosen
     deterministically and recorded in the audit entry with the rule text.
-  - **R8 time budget.** 250 ms per probe, 1 retry × 500 ms backoff, and an
-    OPTIONAL total wall-clock cap that is unset by default because v3
-    leaves it as engineering's call. Measured latency for a local read-only
-    sqlite probe is sub-millisecond; see
-    ``MNEMOSYNE_FEDERATION_TOTAL_BUDGET_MS`` to impose a hard cap
-    (exceeding it is fail-closed, like any other probe failure).
+  - **R8 time budget.** 250 ms per probe, 1 retry × 500 ms backoff, and a
+    total wall-clock cap that defaults to 2 s. v3 leaves the total to
+    engineering; it is CAPPED rather than left unfixed because the probe runs
+    while the home bank's write lock is held, so an uncapped sequence would
+    hold that lock for N × 250 ms (4.75 s today, ~9.5 s with retries).
+    Measured latency for a local read-only sqlite probe is ~0.23 ms, so the
+    default carries ~400× headroom. Exceeding the cap is fail-closed, like any
+    other probe failure; ``MNEMOSYNE_FEDERATION_TOTAL_BUDGET_MS`` moves or
+    removes it.
 
 What this module deliberately is not
 ------------------------------------
@@ -91,6 +94,7 @@ __all__ = [
     "DEFAULT_BACKOFF_S",
     "DEFAULT_PER_PROBE_TIMEOUT_S",
     "DEFAULT_RETRIES",
+    "DEFAULT_TOTAL_BUDGET_S",
     "HandshakeDecision",
     "PeerSpec",
     "fleet_root_for_bank",
@@ -112,18 +116,29 @@ HANDSHAKE_ENV = "MNEMOSYNE_FEDERATION_HANDSHAKE"
 PROBE_TIMEOUT_ENV = "MNEMOSYNE_FEDERATION_PROBE_TIMEOUT_MS"
 
 #: Optional TOTAL wall-clock cap for one full probe sequence, in
-#: milliseconds. UNSET by default: R8 §(b) leaves the total unfixed in v3
-#: and hands the cap to engineering. Measured local read-only probe latency
-#: is sub-millisecond, so no cap is imposed; setting this variable turns any
-#: overrun into a fail-closed refusal (R8 §(d) may amend v3 if a cap is
-#: ratified).
+#: milliseconds. Defaults to :data:`DEFAULT_TOTAL_BUDGET_S` (2 s) because the
+#: probe runs while the home bank's write lock is held (see
+#: ``VeracityConsolidator._record_conflict``): without a cap a full sequence
+#: would hold that lock for N x 250 ms — 4.75 s today, ~9.5 s with retries.
+#: The cap bounds the LOCK HOLD, not correctness: exceeding it is fail-closed
+#: (the home row is not written and a ``federation_probe_failed`` row with
+#: ``error_class='total_budget_exceeded'`` is recorded), and R1's next
+#: detection cycle retries automatically. Measured typical is ~4.8 ms for 19
+#: probes, so the default carries ~400x headroom. Set it to ``0``, ``none``
+#: or ``off`` for an unbounded sequence (v3's literal ratified state); set a
+#: positive number of milliseconds to move the cap. R8 §(d) may amend v3's
+#: text if a cap is ratified.
 TOTAL_BUDGET_ENV = "MNEMOSYNE_FEDERATION_TOTAL_BUDGET_MS"
 
 DEFAULT_PER_PROBE_TIMEOUT_S = 0.25
 DEFAULT_RETRIES = 1
 DEFAULT_BACKOFF_S = 0.5
 
+#: Default total cap in seconds. See :data:`TOTAL_BUDGET_ENV`.
+DEFAULT_TOTAL_BUDGET_S = 2.0
+
 _FALSY = frozenset({"0", "false", "no", "off"})
+_UNBOUNDED = frozenset({"", "0", "none", "off", "false", "unlimited", "unbounded"})
 
 
 class NotABank(Exception):
@@ -154,38 +169,57 @@ def probe_enabled() -> bool:
     return not _env_is_falsy(HANDSHAKE_ENV)
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_seconds(name: str, default_seconds: float) -> float:
+    """Read a millisecond-valued env var and return SECONDS.
+
+    The ``*_MS`` suffix is the fleet's convention (``MNEMOSYNE_BUSY_TIMEOUT_MS``
+    and the E8b census both follow it), so the unit is converted here rather
+    than left for a caller to misread. Non-numeric or non-positive values fall
+    back to the default with a warning — never to zero, which would mean
+    "instant timeout".
+    """
     raw = os.environ.get(name)
     if raw is None:
-        return default
+        return default_seconds
     try:
-        return float(raw)
-    except (TypeError, ValueError):
-        logger.warning("federation handshake: %s=%r is not a number; using %r",
-                       name, raw, default)
-        return default
+        value = float(raw.strip()) / 1000.0
+    except ValueError:
+        logger.warning("federation handshake: %s=%r is not a number; using the %ss default",
+                       name, raw, default_seconds)
+        return default_seconds
+    return value if value > 0 else default_seconds
 
 
 def per_probe_timeout_seconds() -> float:
-    """Per-probe budget in seconds (R8 §(a)). Default 250 ms."""
-    return _env_float(PROBE_TIMEOUT_ENV, DEFAULT_PER_PROBE_TIMEOUT_S)
+    """Per-probe budget in seconds (R8 §(a)).
+
+    ``MNEMOSYNE_FEDERATION_PROBE_TIMEOUT_MS`` (milliseconds) overrides the
+    250 ms default.
+    """
+    return _env_seconds(PROBE_TIMEOUT_ENV, DEFAULT_PER_PROBE_TIMEOUT_S)
 
 
 def total_budget_seconds() -> Optional[float]:
     """Total wall-clock cap for one probe sequence, or ``None`` (unbounded).
 
-    ``None`` is the v3 default and the ratified state: R8 §(b) leaves the
-    total unfixed pending §(d). A set value is a hard, fail-closed deadline.
+    Defaults to :data:`DEFAULT_TOTAL_BUDGET_S`, which bounds how long the
+    probe can hold the home bank's write lock. ``MNEMOSYNE_FEDERATION_TOTAL_BUDGET_MS``
+    overrides it: a positive number of milliseconds moves the cap, and ``0`` /
+    ``none`` / ``off`` removes it (v3's literal "unfixed" state). Exceeding
+    the cap is fail-closed, like any other probe failure.
     """
     raw = os.environ.get(TOTAL_BUDGET_ENV)
     if raw is None:
+        return DEFAULT_TOTAL_BUDGET_S
+    stripped = raw.strip().lower()
+    if stripped in _UNBOUNDED:
         return None
     try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        logger.warning("federation handshake: %s=%r is not a number; ignoring",
-                       TOTAL_BUDGET_ENV, raw)
-        return None
+        value = float(stripped) / 1000.0
+    except ValueError:
+        logger.warning("federation handshake: %s=%r is not a number; using the %ss default",
+                       TOTAL_BUDGET_ENV, raw, DEFAULT_TOTAL_BUDGET_S)
+        return DEFAULT_TOTAL_BUDGET_S
     return value if value > 0 else None
 
 
@@ -715,8 +749,10 @@ def probe_fleet(
         per_probe_timeout_s: R8 §(a) budget. Defaults to the env value
             (:data:`PROBE_TIMEOUT_ENV`) or 250 ms.
         retries, backoff_s: R8 §(c) — 1 retry × 500 ms by default.
-        total_budget_s: R8 §(b) cap; ``None`` (default) is unbounded, which
-            is v3's ratified state.
+        total_budget_s: R8 §(b) cap. ``None`` uses the resolved default
+            (:func:`total_budget_seconds`, 2 s unless overridden); a positive
+            value sets the cap; ``0`` or negative means unbounded, matching
+            the env convention.
         sleep: Injectable backoff sleep (tests pass a no-op).
 
     Returns:
@@ -725,7 +761,11 @@ def probe_fleet(
         the audit chain; ``decision.audit_events()`` is what to persist.
     """
     timeout_s = per_probe_timeout_s if per_probe_timeout_s is not None else per_probe_timeout_seconds()
-    budget_s = total_budget_s if total_budget_s is not None else total_budget_seconds()
+    if total_budget_s is None:
+        budget_s = total_budget_seconds()
+    else:
+        # 0/negative == unbounded, matching the env convention.
+        budget_s = total_budget_s if total_budget_s > 0 else None
 
     # R2's key. The census owns normalization; reusing its function (rather
     # than re-spelling it) is what keeps this probe's key from drifting from

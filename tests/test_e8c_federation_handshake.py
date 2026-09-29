@@ -151,6 +151,14 @@ def _audit_rows(bank: Path):
     return rows
 
 
+def _fact_count(bank: Path) -> int:
+    conn = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM consolidated_facts").fetchone()[0]
+    finally:
+        conn.close()
+
+
 def _fingerprint(bank: Path) -> dict:
     """Schema + counts + bytes + mtime, so a write anywhere shows up."""
     conn = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
@@ -471,9 +479,23 @@ class TestFailClosed:
         assert fh._classify_error(sqlite3.OperationalError("interrupted")) == "timeout"
         assert fh._classify_error(TimeoutError("x")) == "timeout"
 
-    def test_total_budget_is_unset_by_default_and_hard_when_set(self, tmp_path):
-        assert fh.total_budget_seconds() is None
+    def test_total_budget_defaults_to_a_bounded_lock_hold(self, monkeypatch):
+        """R8's total is CAPPED by default.
 
+        The probe runs while the home bank's write lock is held, so an
+        unbounded sequence would hold that lock for N x 250 ms (4.75 s today).
+        The cap bounds the LOCK HOLD; exceeding it is fail-closed and R1's next
+        detection cycle retries.
+        """
+        assert fh.total_budget_seconds() == fh.DEFAULT_TOTAL_BUDGET_S
+        monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, "0")
+        assert fh.total_budget_seconds() is None
+        monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, "none")
+        assert fh.total_budget_seconds() is None
+        monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, "750")
+        assert fh.total_budget_seconds() == 0.75
+
+    def test_exceeding_the_total_budget_refuses_every_remaining_probe(self, tmp_path):
         fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
         decision = fh.probe_fleet(
             PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
@@ -483,9 +505,32 @@ class TestFailClosed:
         assert decision.probes_run == 0
         assert {f["error_class"] for f in decision.failed} == {"total_budget_exceeded"}
         assert len(decision.failed) == 3  # shared, root, beta — all refused unfunded
+        assert [e["action"] for e in decision.audit_events()] == (
+            ["federation_probe_failed"] * 3 + ["federation_probe"])
+
+    def test_an_explicit_zero_budget_means_unbounded(self, tmp_path):
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        decision = fh.probe_fleet(
+            PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
+            total_budget_s=0, sleep=_noop_sleep)
+        assert decision.refused is False
+        assert decision.probes_run == 3
 
     def test_per_probe_budget_defaults_to_250ms(self):
         assert fh.per_probe_timeout_seconds() == 0.25
+
+    def test_millisecond_env_vars_are_converted_to_seconds(self, monkeypatch):
+        """The ``*_MS`` suffix is the fleet's convention (``MNEMOSYNE_BUSY_TIMEOUT_MS``,
+        the E8b census), so the unit is converted rather than read as seconds —
+        a 1000x budget error otherwise."""
+        monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, "250")
+        assert fh.per_probe_timeout_seconds() == 0.25
+        monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, "50")
+        assert fh.per_probe_timeout_seconds() == 0.05
+        monkeypatch.setenv(fh.PROBE_TIMEOUT_ENV, "0")
+        assert fh.per_probe_timeout_seconds() == fh.DEFAULT_PER_PROBE_TIMEOUT_S
+        monkeypatch.setenv(fh.TOTAL_BUDGET_ENV, "2500")
+        assert fh.total_budget_seconds() == 2.5
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +640,56 @@ class TestUpsertPath:
         probe = [a for a in audits if a["action"] == "federation_probe"]
         assert len(probe) == 1
         assert probe[0]["metadata"]["refused"] is True
+
+    def test_transient_peer_failure_recovers_and_the_home_row_is_recorded(
+            self, tmp_path, monkeypatch):
+        """R8 §(c)'s single retry exists so a transient failure is not a LOST
+        conflict: the peer is re-checked, the sequence completes, and the home
+        row lands with a non-refused audit entry."""
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        home = _profile(fleet, "alpha")
+
+        real = fh._check_bank
+        state = {"calls": 0}
+
+        def flaky(path):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real(path)
+
+        monkeypatch.setattr(fh, "_check_bank", flaky)
+        self._upsert_once(home)
+
+        assert state["calls"] > 1  # the retry actually ran
+        assert len(_conflict_rows(home)) == 1
+        metadata = _audit_rows(home)[0]["metadata"]
+        assert metadata["refused"] is False
+        assert metadata["proceeded"] is True
+
+    def test_probe_refusal_refuses_the_conflict_row_not_the_detected_fact(
+            self, tmp_path):
+        """R3 §(g) refuses the upsert R2 defines — the CONFLICTS insert.
+
+        Rolling back the consolidated fact too would drop THIS bank's own data
+        on another bank's account (a peer was unreadable), and the fact is
+        detected state, not the duplicate R3 exists to stop. R1's metric stream
+        carries the signal into the next detection cycle.
+        """
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        broken = fleet / "profiles" / "broken" / "mnemosyne" / "data" / "mnemosyne.db"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_bytes(b"this is not a sqlite database\n")
+        home = _profile(fleet, "alpha")
+
+        self._upsert_once(home)
+
+        assert _conflict_rows(home) == []
+        assert _fact_count(home) == 2  # both detected facts committed
+        audits = _audit_rows(home)
+        assert [a["action"] for a in audits] == [
+            "federation_probe_failed", "federation_probe"]
+        assert audits[1]["metadata"]["refused"] is True
 
     def test_root_insert_grows_while_profiles_skip_and_name_root(self, tmp_path):
         """Criterion (b): twin at root + 2 profiles -> root grows."""
