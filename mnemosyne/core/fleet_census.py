@@ -73,6 +73,32 @@ logger = logging.getLogger(__name__)
 #: point the census at a fixture.
 FLEET_ROOT_ENV = "MNEMOSYNE_FLEET_ROOT"
 
+#: Opt-out for the every-sleep census walk: ``MNEMOSYNE_FLEET_CENSUS=0``
+#: (or any value in :data:`_FALSY`). Checked at CALL time, never cached — a
+#: sleep pass that reads the flag once and keeps it would defeat the point of
+#: an operator being able to stop the walk without restarting the gateway.
+#: The walk itself stays cheap (pruned, ``stat``-only discovery), so this is
+#: the escape hatch for a pathologically large tree, not a correctness gate.
+CENSUS_ENV = "MNEMOSYNE_FLEET_CENSUS"
+
+#: Values that mean "off". Same set the federation handshake uses
+#: (``federation_handshake._FALSY``); an unset or unrecognised value is ON.
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def census_enabled() -> bool:
+    """Whether the sleep-time fleet census runs. ``MNEMOSYNE_FLEET_CENSUS``.
+
+    Unset (or any value outside :data:`_FALSY`) means enabled — the census is
+    what keeps R6's acceptance bound measured rather than asserted, so its
+    default must stay on. Resolved on every call so an operator can stop and
+    restart the walk at runtime.
+    """
+    raw = os.environ.get(CENSUS_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in _FALSY
+
 #: Directories that never hold a live bank. Pruned during the walk so the
 #: census stays cheap enough to run on every sleep pass. Mirrors the skip
 #: list the acceptance measurement used (``backups``, ``cache``,
@@ -354,7 +380,12 @@ def census(root: Optional[Path] = None, banks: Optional[List[Path]] = None) -> D
         "surface_home_twins": surface_home_twins,
         # R6's accepted-scope bound, stated as a boolean so a caller does not
         # have to remember which direction of the count is the safe one.
+        # Fail CLOSED on partial data: a bank that could not be read is an
+        # unmeasured holder, so a census taken over a fleet with one
+        # unreadable bank must not report the bound as holding — "no twins
+        # found" and "no twins COULD be found" are different facts, and only
+        # the second one is safe to read as a maintained bound.
         "bound": "home-to-home normalized conflict twins held by 2+ non-shared banks",
-        "bound_holds": len(home_home_twins) == 0,
+        "bound_holds": len(home_home_twins) == 0 and not report["unreadable"],
     })
     return report
