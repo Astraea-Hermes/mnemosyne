@@ -1639,10 +1639,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         Mnemosyne tools. ``tools: []`` exposes no tools while still allowing the
         provider's memory context/prefetch surface to initialize. Unknown names
         fail loudly so operators catch typos during Hermes startup instead of
-        silently losing tools.
+        silently losing tools. The serialized sentinels "None", "null" (any
+        case) and the empty string are also treated as unconfigured, since a
+        config/UI layer can round-trip a real ``None`` into one of those
+        strings instead of YAML ``null``.
         """
         configured = self._read_config_key("tools")
         if configured is None:
+            return list(ALL_TOOL_SCHEMAS)
+        if isinstance(configured, str) and configured.strip().lower() in ("", "none", "null"):
             return list(ALL_TOOL_SCHEMAS)
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
@@ -3784,11 +3789,26 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             _wid, _whome = (get_active_profile_name() or ""), str(get_hermes_home())
         except Exception:
             _wid, _whome = "", ""
-        row = store.remember(
-            owner_id, category, name, body,
-            source=source, confidence=confidence,
-            writer_id=_wid, writer_home=_whome,
-        )
+        _writer_degraded = False
+        try:
+            row = store.remember(
+                owner_id, category, name, body,
+                source=source, confidence=confidence,
+                writer_id=_wid, writer_home=_whome,
+            )
+        except TypeError as _te:
+            # Writer provenance kwargs unsupported by the INSTALLED store
+            # build (provider runtime older than this plugin — bundle/host
+            # version skew, seen 2026-09-28: mnemosyne b3 store vs b4-aware
+            # adapter). Degrade with disclosure: an older library must not
+            # veto governance writes, and never silently drop attribution.
+            if "writer_id" not in str(_te) and "writer_home" not in str(_te):
+                raise
+            _writer_degraded = True
+            row = store.remember(
+                owner_id, category, name, body,
+                source=source, confidence=confidence,
+            )
         if row is None:
             return json.dumps({"status": "filtered", "store": "canonical"})
         status = row.pop("status", "stored")
@@ -3796,7 +3816,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "remember_canonical", bank="canonical",
             source_tool="mnemosyne_remember_canonical",
             metadata={"category": category, "name": name, "status": status,
-                      "version": row.get("version")},
+                      "version": row.get("version"),
+                      "writer_degraded": _writer_degraded},
         )
         return json.dumps({
             "status": status,
