@@ -5584,6 +5584,22 @@ def _cross_session_max_llm_validations() -> int:
         return _CROSS_SESSION_MAX_LLM_VALIDATIONS
 
 
+# Veracity-by-write-channel map (astraea hand 2026-09-29). Deliberate writes
+# pass veracity explicitly; this only fires when a row is born with the
+# 'unknown' default, replacing "nobody looked" with the honest weakest-true
+# class of the channel that produced it. Never inflates: unmapped sources stay
+# 'unknown'. conversation->stated because a captured utterance IS a speaker's
+# claim (self-report, citable and humble per the state clause); tool/verification
+# ->tool because the writer is an instrument; document->imported by definition.
+_VERACITY_BY_SOURCE = {
+    "conversation": "stated",
+    "tool": "tool",
+    "verification": "tool",
+    "document": "imported",
+}
+>>>>>>> b9519ed2 (feat(write-provenance): veracity by channel, author at write, trim tombstones)
+
+
 class BeamMemory:
     """
     BEAM memory interface.
@@ -5841,6 +5857,8 @@ class BeamMemory:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
+                 author_id: Optional[str] = None,
+                 author_type: Optional[str] = None,
                  dedupe: bool = True,
                  _write_kind: object = "public",
                  _write_policy=None,
@@ -6022,6 +6040,10 @@ class BeamMemory:
                 # Enrichment can refill enhanced recall after the early post-commit eviction.
                 self._invalidate_query_cache_after_remember_commit()
 
+        if veracity == "unknown":
+            # Write-channel derivation: see _VERACITY_BY_SOURCE note.
+            veracity = _VERACITY_BY_SOURCE.get(source, "unknown")
+
         memory_id = memory_id or _generate_id(content)
         timestamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         cursor = self.conn.cursor()
@@ -6032,7 +6054,8 @@ class BeamMemory:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (memory_id, content, source, timestamp, self.session_id, importance,
               json.dumps(metadata or {}), valid_until, scope,
-              self.author_id, self.author_type, self.channel_id, veracity, memory_type, trust_tier))
+              author_id or self.author_id, author_type or self.author_type,
+              self.channel_id, veracity, memory_type, trust_tier))
         self.conn.commit()
         try:
             self._trim_working_memory()
@@ -6653,8 +6676,12 @@ class BeamMemory:
         # keep-newest-N survivor set is the true newest by instant.
         # Pinned rows are exempt from trim (matching sleep()'s exemption):
         # they are neither TTL-deleted nor displaced from the survivor set.
-        self.conn.execute(f"""
-            DELETE FROM working_memory
+        # Trim leaves evidence (2026-09-29): the doomed set is selected and
+        # tombstoned before the DELETE, so a cited row that later vanishes
+        # resolves to "trimmed <when>" instead of being indistinguishable
+        # from a never-minted id (the handle-rot ambiguity measured in the
+        # shared-journal census: 33 dangling citations, zero traces).
+        _trim_sql = f"""
             WHERE session_id = ?
               AND consolidated_at IS NULL
               AND (pinned IS NULL OR pinned = 0)
@@ -6668,8 +6695,51 @@ class BeamMemory:
                     LIMIT ?
                 )
               )
-        """, (self.session_id, cutoff, self.session_id, WORKING_MEMORY_MAX_ITEMS))
+        """
+        _trim_params = (self.session_id, cutoff, self.session_id, WORKING_MEMORY_MAX_ITEMS)
+        doomed = [r[0] for r in self.conn.execute(
+            f"SELECT id FROM working_memory {_trim_sql}", _trim_params)]
+        if doomed:
+            self._record_trim_tombstones(doomed)
+        self.conn.execute(f"DELETE FROM working_memory {_trim_sql}", _trim_params)
         self.conn.commit()
+
+    def _record_trim_tombstones(self, ids: "List[str]") -> None:
+        """One 'trim' audit_log row per TTL/size-evicted working_memory id.
+
+        Best-effort: a tombstone write failure must never veto the trim, and
+        must never raise into remember() (the trim runs inline after every
+        write). The audit_log schema mirrors the integration's own table so
+        standalone banks gain it on first eviction.
+        """
+        try:
+            import time as _time
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    action TEXT NOT NULL,
+                    memory_id TEXT,
+                    bank TEXT,
+                    scope TEXT,
+                    profile TEXT,
+                    session_id TEXT,
+                    source_tool TEXT,
+                    tokens_used INTEGER,
+                    reason TEXT,
+                    metadata_json TEXT
+                )""")
+            now = _time.time()
+            bank = "surface" if "shared" in str(self.db_path) else "private"
+            self.conn.executemany(
+                "INSERT INTO audit_log(timestamp, action, memory_id, bank, "
+                "session_id, source_tool, reason) "
+                "VALUES (?, 'trim', ?, ?, ?, '_trim_working_memory', ?)",
+                [(now, mid, bank, self.session_id,
+                  "ttl/size eviction; consolidated & pinned exempt") for mid in ids])
+            self.conn.commit()
+        except Exception:
+            logger.warning("trim tombstone write failed for %d ids", len(ids), exc_info=True)
 
     def get_context(self, limit: int = 10) -> List[Dict]:
         """Get working_memory for prompt injection.
