@@ -587,6 +587,14 @@ class TestFailClosed:
         decision = fh.probe_fleet(
             PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
             banks=[_profile(fleet, "beta")],
+            # Absent explicit surface/root paths: a missing file is not a
+            # bank and is skipped without a failure, so beta is the ONLY
+            # probeable peer. Without this, the shared probe is the one that
+            # overruns and the in-loop guard then refuses root and beta
+            # unfunded — assertions that would still pass with the post-loop
+            # recheck deleted.
+            shared_db=tmp_path / "absent-shared.db",
+            root_db=tmp_path / "absent-root.db",
             total_budget_s=0.2, sleep=_noop_sleep)
 
         assert decision.refused is True
@@ -596,7 +604,8 @@ class TestFailClosed:
         # total_budget_exceeded — a successful probe never authorizes the
         # insert past the cap.
         assert {f["error_class"] for f in decision.failed} == {"total_budget_exceeded"}
-        assert len(decision.failed) == 2  # root and beta, refused unfunded
+        assert len(decision.failed) == 1  # only the post-loop recheck fires
+        assert decision.chain
 
     def test_probe_one_deadline_skips_a_backoff_that_cannot_fit(self, tmp_path):
         """R8 §(b) bounds the whole retry sequence, not each attempt alone.
