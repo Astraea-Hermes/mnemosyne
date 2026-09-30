@@ -561,19 +561,29 @@ def _check_bank_retrying(
     backoff_s: float,
     sleep: Callable[[float], None],
     lock_timeout_s: Optional[float] = None,
+    deadline: Optional[float] = None,
+    total_budget_s: Optional[float] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """Decide whether ``path`` is a probeable bank, with R8's retry budget.
 
     Returns ``(should_probe, failure_or_None)``:
 
       * ``(True, None)``  — a readable bank: probe it;
-      * ``(False, None)`` — not a bank at all (no ``conflicts`` table):
-        skipped, exactly as the fleet census skips it;
-      * ``(False, failure)`` — a read error, recorded for R3 §(g) refusal.
+      * ``(False, None)`` — not a bank at all (no ``conflicts`` table), or a
+        missing file: skipped, exactly as the fleet census skips it;
+      * ``(False, failure)`` — a read error OR a budget stop, recorded for
+        R3 §(g) refusal.
 
     The retry/backoff here is the same budget ``_probe_one`` uses, so a
     transient read error at enumeration time cannot escape the fail-closed
     path just because it happened one step earlier.
+
+    When the caller passes an absolute ``deadline``, it bounds the whole
+    sequence, not each attempt alone: the lock wait is clamped to the time
+    left, a backoff that cannot land before the deadline is skipped, and an
+    abandoned decision is reported as a FAILURE (``total_budget_exceeded``
+    or the probe's own error) — never as ``(False, None)``, which means
+    "not a bank" and would silently drop the candidate fail-OPEN.
     """
     # A path that is not a FILE is not a live bank: it is out of scope, not a
     # failure. This matters for the shared surface and the root bank, which
@@ -585,18 +595,31 @@ def _check_bank_retrying(
             return False, None
     except OSError:  # pragma: no cover - defensive
         return False, None
+    last_failure: Optional[Dict[str, Any]] = None
     for attempt in range(retries + 1):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            # Out of budget at the top of an attempt: report, never skip.
+            return False, last_failure or _budget_failure(path, total_budget_s)
+        lock_limit = lock_timeout_s
+        if remaining is not None:
+            lock_limit = remaining if lock_limit is None else min(lock_limit, remaining)
         try:
-            _check_bank(path, lock_timeout_s=lock_timeout_s)
+            _check_bank(path, lock_timeout_s=lock_limit)
             return True, None
         except NotABank:
             return False, None
         except Exception as exc:  # noqa: BLE001 - classify, never swallow
+            last_failure = _failure(path, exc)
             if attempt < retries:
+                if deadline is not None and backoff_s >= deadline - time.monotonic():
+                    # The retry's backoff cannot land inside the caller's
+                    # budget: abandon it with the real failure on record.
+                    return False, last_failure
                 sleep(backoff_s)
                 continue
-            return False, _failure(path, exc)
-    return False, None  # pragma: no cover - unreachable with retries >= 0
+            return False, last_failure
+    return False, last_failure or _budget_failure(path, total_budget_s)  # pragma: no cover
 
 
 def _probe_one(
@@ -608,6 +631,8 @@ def _probe_one(
     backoff_s: float,
     sleep: Callable[[float], None],
     lock_timeout_s: Optional[float] = None,
+    deadline: Optional[float] = None,
+    total_budget_s: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """Probe ONE bank for the pair. Returns ``(hits, failure_or_None)``.
 
@@ -621,22 +646,37 @@ def _probe_one(
     VM work and the progress handler is never called during one. Bounded
     retries: one retry after ``backoff_s``; beyond that the probe is a
     failure and the upsert refuses (R3 §(g) / R8 §(c)).
+
+    The caller's absolute ``deadline`` (R8 §(b)'s clock, started before
+    scope) bounds the WHOLE sequence, not each attempt alone: every attempt
+    recomputes the time left and clamps its query budget and lock wait to
+    it, and a backoff that cannot land before the deadline is skipped —
+    stopping with the probe's own failure on record (or
+    ``total_budget_exceeded`` if no attempt could start at all). Without
+    that, a retrying probe (2 × 250 ms + 500 ms backoff) could start with
+    10 ms left and overrun the cap while still holding the home write lock.
     """
-    lock_timeout = timeout_s if lock_timeout_s is None else min(timeout_s, max(0.0, lock_timeout_s))
+    lock_cap = timeout_s if lock_timeout_s is None else min(timeout_s, max(0.0, lock_timeout_s))
     last_failure: Optional[Dict[str, Any]] = None
     for attempt in range(retries + 1):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return [], last_failure or _budget_failure(bank, total_budget_s)
+        attempt_timeout = timeout_s if remaining is None else min(timeout_s, remaining)
+        lock_timeout = min(lock_cap, attempt_timeout)
         connection: Optional[sqlite3.Connection] = None
         try:
-            # The deadline covers the lock wait too: start it before connect
-            # so a 5-second default can never hide inside a 250 ms budget.
-            deadline = time.monotonic() + timeout_s
+            # The per-attempt deadline covers the lock wait too: start it
+            # before connect so a 5-second default can never hide inside a
+            # 250 ms budget.
+            attempt_deadline = time.monotonic() + attempt_timeout
             connection = sqlite3.connect(
                 f"{bank.as_uri()}?mode=ro", uri=True,
                 timeout=_connect_timeout_seconds(lock_timeout),
             )
 
             def _budget_exceeded() -> int:
-                return 1 if time.monotonic() > deadline else 0
+                return 1 if time.monotonic() > attempt_deadline else 0
 
             connection.set_progress_handler(_budget_exceeded, 1000)
             connection.row_factory = sqlite3.Row
@@ -660,6 +700,11 @@ def _probe_one(
         except Exception as exc:  # noqa: BLE001 - every failure must fail closed
             last_failure = _failure(bank, exc)
             if attempt < retries:
+                if deadline is not None and backoff_s >= deadline - time.monotonic():
+                    # The retry's backoff cannot land inside the caller's
+                    # budget: stop here with the real failure on record —
+                    # the caller refuses, and the lock is released early.
+                    return [], last_failure
                 sleep(backoff_s)
         finally:
             if connection is not None:
@@ -761,7 +806,8 @@ def _probe_scope(
         lock_timeout = probe_timeout_s if remaining is None else min(probe_timeout_s, remaining)
         should_probe, failure = _check_bank_retrying(
             path, retries=retries, backoff_s=backoff_s, sleep=sleep,
-            lock_timeout_s=lock_timeout)
+            lock_timeout_s=lock_timeout,
+            deadline=deadline, total_budget_s=total_budget_s)
         if failure is not None:
             failures.append(failure)
         return should_probe
@@ -955,10 +1001,14 @@ def probe_fleet(
             backoff_s=backoff_s,
             sleep=sleep,
             lock_timeout_s=remaining,
+            deadline=deadline,
+            total_budget_s=budget_s,
         )
         decision.probes_run += 1
         decision.probed_banks.append(peer.path)
         if failure is not None:
+            if failure.get("error_class") == "total_budget_exceeded":
+                budget_exceeded_recorded = True
             decision.failed.append(failure)
             decision.refused = True
             continue

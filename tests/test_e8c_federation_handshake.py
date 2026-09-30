@@ -553,7 +553,7 @@ class TestFailClosed:
 
         decision = fh.probe_fleet(
             PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
-            banks=[broken, good], total_budget_s=0.2, backoff_s=0.3,
+            banks=[broken, good], total_budget_s=0.2, backoff_s=0.1,
             sleep=_slow)
 
         assert decision.refused is True
@@ -562,28 +562,83 @@ class TestFailClosed:
         assert decision.probes_run == 0, decision.probed_banks
         assert "total_budget_exceeded" in {f["error_class"] for f in decision.failed}
 
-    def test_a_last_probe_overrunning_the_budget_refuses_the_upsert(self, tmp_path):
-        """The deadline is rechecked AFTER the loop.
+    def test_a_last_probe_overrunning_the_budget_refuses_the_upsert(self, tmp_path, monkeypatch):
+        """The deadline is rechecked AFTER the loop, on a probe that SUCCEEDED.
 
-        The pre-probe guard only asks whether a probe may START. A last probe
-        that started inside the budget and finished past it left ``proceed``
-        true, so the caller inserted a conflict row whose probe sequence had
-        overrun R8's cap.
+        The pre-probe guard only asks whether a probe may START. A last
+        probe that started inside the budget and finished past it would
+        otherwise leave ``proceed`` true, so the caller inserts a conflict
+        row whose probe sequence overran R8's cap. The probe here SUCCEEDS
+        by construction — it sleeps past the deadline and reports a holder —
+        so only the post-loop recheck can catch it: this test isolates that
+        check instead of reaching it through the retry path (retry sleeps
+        now respect the absolute deadline, so the old slow-backoff shape
+        cannot manufacture an overrun anymore).
         """
-        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
-        slow_bank = _make_bank_without_pair_columns(fleet / "profiles" / "slow" / "mnemosyne.db")
+        fleet = _build_fleet(
+            tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
 
-        def _slow(_seconds: float) -> None:
-            time.sleep(0.4)
+        def _overrun_probe(bank, pair, **_kwargs):
+            time.sleep(0.35)  # started at ~0.2 - ε left; finishes well past it
+            return [{"id": 1, "bank_path": str(bank), "resolution": None,
+                     "resolution_status": None, "created_at": "2026-09-29T00:00:00"}], None
 
+        monkeypatch.setattr(fh, "_probe_one", _overrun_probe)
         decision = fh.probe_fleet(
             PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
-            banks=[slow_bank], per_probe_timeout_s=5.0, retries=1,
-            backoff_s=0.4, total_budget_s=0.3, sleep=_slow)
+            banks=[_profile(fleet, "beta")],
+            total_budget_s=0.2, sleep=_noop_sleep)
 
         assert decision.refused is True
         assert decision.proceed is False
-        assert "total_budget_exceeded" in {f["error_class"] for f in decision.failed}
+        assert decision.probes_run == 1
+        # The overrun is reported once per unfunded candidate, and only as
+        # total_budget_exceeded — a successful probe never authorizes the
+        # insert past the cap.
+        assert {f["error_class"] for f in decision.failed} == {"total_budget_exceeded"}
+        assert len(decision.failed) == 2  # root and beta, refused unfunded
+
+    def test_probe_one_deadline_skips_a_backoff_that_cannot_fit(self, tmp_path):
+        """R8 §(b) bounds the whole retry sequence, not each attempt alone.
+
+        A 5 s per-probe budget inside a deadline with 100 ms left may get
+        ONE attempt: the 500 ms backoff cannot land before the deadline, so
+        ``_probe_one`` must stop and report the probe's own failure instead
+        of sleeping past the cap while the caller holds the home write lock.
+        """
+        broken = _make_bank_without_pair_columns(
+            tmp_path / "overrun-peer" / "mnemosyne.db")
+        slept: list = []
+
+        hits, failure = fh._probe_one(
+            broken, PAIR, timeout_s=5.0, retries=2, backoff_s=0.5,
+            sleep=slept.append,
+            deadline=time.monotonic() + 0.1, total_budget_s=0.1)
+
+        assert hits == []
+        assert failure is not None
+        assert slept == []  # every backoff that would overrun: skipped
+
+    def test_check_bank_retrying_reports_budget_stop_never_a_silent_skip(
+            self, tmp_path):
+        """``(False, None)`` means "not a bank" — a budget stop must not wear it.
+
+        A candidate whose retries ran out of the absolute deadline was never
+        DECIDED; skipping it silently is the fail-open R3 §(g) forbids, so
+        the helper records ``total_budget_exceeded`` instead.
+        """
+        broken = tmp_path / "unreadable.db"
+        broken.write_bytes(b"this is not a sqlite database\n")
+
+        should_probe, failure = fh._check_bank_retrying(
+            broken, retries=1, backoff_s=0.5, sleep=_noop_sleep,
+            deadline=time.monotonic() - 1.0,  # already out of budget
+            total_budget_s=0.2)
+
+        assert should_probe is False
+        assert failure is not None
+        assert failure["error_class"] == "total_budget_exceeded"
+        assert failure["probe_target"] == str(broken)
 
     def test_a_locked_peer_refuses_within_the_probe_budget(self, tmp_path):
         """A held write lock must not outlast the probe budget.
