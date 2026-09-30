@@ -75,6 +75,27 @@ def _noop_sleep(_seconds: float) -> None:
     return None
 
 
+class _FakeClock:
+    """A monotonic clock that only advances when the test says so.
+
+    The budget tests run a ~0.2 s total against a REAL clock: a scheduler
+    stall before the event under test can consume the budget early and change
+    WHICH guard fires (the pre-probe skip instead of the post-loop recheck),
+    so the assertion can fail without the code under test misbehaving. Patch
+    it in place of ``fh.time.monotonic`` and advance it from inside the
+    injected ``sleep`` callback to make the budget deterministic.
+    """
+
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 def _make_bank(path: Path, rows=()) -> Path:
     """Create a bank holding a conflicts table.
 
@@ -534,7 +555,8 @@ class TestFailClosed:
         assert decision.refused is False
         assert decision.probes_run == 3
 
-    def test_scope_resolution_runs_inside_the_total_budget(self, tmp_path):
+    def test_scope_resolution_runs_inside_the_total_budget(self, tmp_path,
+                                                           monkeypatch):
         """The clock starts BEFORE scope, so scope backoff is budgeted.
 
         Scope decides bank liveness with the same retry/backoff budget a
@@ -548,8 +570,11 @@ class TestFailClosed:
         good = _profile(fleet, "beta")
         _make_bank(good, [])
 
+        clock = _FakeClock()
+        monkeypatch.setattr(fh.time, "monotonic", clock)
+
         def _slow(_seconds: float) -> None:
-            time.sleep(0.3)
+            clock.advance(0.3)  # one backoff outruns the 0.2 s budget
 
         decision = fh.probe_fleet(
             PAIR, _profile(fleet, "alpha"), fleet_root=fleet,
@@ -569,8 +594,9 @@ class TestFailClosed:
         probe that started inside the budget and finished past it would
         otherwise leave ``proceed`` true, so the caller inserts a conflict
         row whose probe sequence overran R8's cap. The probe here SUCCEEDS
-        by construction — it sleeps past the deadline and reports a holder —
-        so only the post-loop recheck can catch it: this test isolates that
+        by construction — it advances the fake clock past the deadline and
+        reports a holder — so only the post-loop recheck can catch it: this
+        test isolates that
         check instead of reaching it through the retry path (retry sleeps
         now respect the absolute deadline, so the old slow-backoff shape
         cannot manufacture an overrun anymore).
@@ -578,8 +604,11 @@ class TestFailClosed:
         fleet = _build_fleet(
             tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
 
+        clock = _FakeClock()
+        monkeypatch.setattr(fh.time, "monotonic", clock)
+
         def _overrun_probe(bank, pair, **_kwargs):
-            time.sleep(0.35)  # started at ~0.2 - ε left; finishes well past it
+            clock.advance(0.35)  # started before the deadline; ends past it
             return [{"id": 1, "bank_path": str(bank), "resolution": None,
                      "resolution_status": None, "created_at": "2026-09-29T00:00:00"}], None
 
