@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 import time
 from datetime import datetime
@@ -1048,3 +1049,185 @@ class TestUpsertPath:
         metadata = decision.audit_events()[0]["metadata"]
         for key in ("read_at_utc", "read_at_local", "local_zone", "utc_offset_seconds"):
             assert key in metadata
+
+
+# ---------------------------------------------------------------------------
+# 8. Probe placement and the pending queue (PR #1082 review threads
+#    PRRT_kwDOR6YkqM6nPOsB / POsH): the handshake must run OUTSIDE the
+#    home bank's write transaction, and a pair refused by a transient
+#    probe failure must be QUEUED, not dropped.
+# ---------------------------------------------------------------------------
+def _pending_pairs(bank: Path):
+    conn = sqlite3.connect(f"{bank.as_uri()}?mode=ro", uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM conflict_probe_pending ORDER BY created_at")]
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return rows
+
+
+class TestPostCommitProbe:
+
+    def _double_upsert(self, consolidator) -> None:
+        consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_OLD, "stated", "s1")
+        consolidator.consolidate_fact(SUBJECT, PREDICATE, OBJECT_NEW, "stated", "s2")
+
+    def test_probe_never_runs_inside_the_home_write_transaction(
+            self, tmp_path, monkeypatch):
+        """Review thread POsB: the fleet probe must not hold the home
+        bank's ``BEGIN IMMEDIATE`` -- no filesystem walk, no per-peer
+        connection, no retry sleep inside the write lock."""
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        home = _profile(fleet, "alpha")
+        real = fh.probe_fleet
+        tx_at_probe: list = []
+
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            def spy(pair, bank, **kwargs):
+                # ``in_transaction`` on the consolidator's own connection:
+                # False now means the upsert's tx had already committed
+                # before the handshake ran.
+                tx_at_probe.append(consolidator.conn.in_transaction)
+                return real(pair, bank, **kwargs)
+
+            monkeypatch.setattr(fh, "probe_fleet", spy)
+            self._double_upsert(consolidator)
+        finally:
+            consolidator.close()
+
+        assert tx_at_probe, "the gate must have probed at least once"
+        assert not any(tx_at_probe), (
+            "probe_fleet ran while the home bank was mid-transaction -- "
+            "the write lock still covers the fleet probe")
+        # End state unchanged: empty peers, home row grows.
+        assert len(_conflict_rows(home)) == 1
+
+    def test_home_bank_accepts_a_second_writer_while_the_probe_runs(
+            self, tmp_path, monkeypatch):
+        """Red at the pre-fix head: with the probe inside the upsert's
+        ``BEGIN IMMEDIATE``, an intruder connection with ``busy_timeout``
+        of zero raises ``database is locked`` at exactly the moment the
+        handshake runs. Post-fix the probe is after the commit, so the
+        write lock is free and the intruder's write lands."""
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        home = _profile(fleet, "alpha")
+        real = fh.probe_fleet
+        outcomes: list = []
+
+        def probe_with_intruder(pair, bank, **kwargs):
+            other = sqlite3.connect(str(home), timeout=0)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.execute(
+                    "INSERT INTO consolidated_facts "
+                    "(id, subject, predicate, object) "
+                    "VALUES ('intruder', 'Zed', 'is', 'here')")
+                other.commit()
+                outcomes.append("free")
+            except sqlite3.OperationalError as exc:
+                outcomes.append(f"locked: {exc}")
+            finally:
+                other.close()
+            return real(pair, bank, **kwargs)
+
+        monkeypatch.setattr(fh, "probe_fleet", probe_with_intruder)
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            self._double_upsert(consolidator)
+        finally:
+            consolidator.close()
+
+        assert outcomes == ["free"], outcomes
+        assert len(_conflict_rows(home)) == 1
+
+    def test_refused_pair_is_queued_not_dropped_and_the_next_pass_records_it(
+            self, tmp_path):
+        """Review thread POsH: one transient peer error used to delete the
+        contradiction forever (no row, no re-check on the UPDATE branch).
+        Now the refused pair is durable in ``conflict_probe_pending`` --
+        across connections, i.e. across process death -- and the sleep
+        path's ``run_consolidation_pass`` re-probes and records it once
+        the peer is gone."""
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ())])
+        broken = _profile(fleet, "broken")
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_bytes(b"this is not a sqlite database\n")
+        home = _profile(fleet, "alpha")
+
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            self._double_upsert(consolidator)
+            # Fail-closed today: no conflict row...
+            assert _conflict_rows(home) == []
+            # ...the detected facts still commit...
+            assert _fact_count(home) == 2
+            # ...the refusal is audited...
+            audits = _audit_rows(home)
+            assert [a["action"] for a in audits] == [
+                "federation_probe_failed", "federation_probe"]
+            assert audits[1]["metadata"]["refused"] is True
+            # ...and the pair is queued, NOT lost.
+            queued = _pending_pairs(home)
+            assert [(q["fact_a_id"], q["fact_b_id"]) for q in queued] == [UPSERT_PAIR]
+        finally:
+            consolidator.close()
+
+        # The peer disappears (healed / removed). A FRESH consolidator --
+        # standing in for the next sleep after any restart -- settles it.
+        shutil.rmtree(fleet / "profiles" / "broken")
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            consolidator.run_consolidation_pass()
+        finally:
+            consolidator.close()
+
+        assert len(_conflict_rows(home)) == 1
+        assert _pending_pairs(home) == []
+
+    def test_a_crashed_probe_keeps_the_pair_queued_and_the_upsert_clean(
+            self, tmp_path, monkeypatch):
+        """The queue is written inside the fact's transaction, so even a
+        handshake module that raises out of contract leaves the pair
+        durable and the caller's write successful."""
+        fleet = _build_fleet(tmp_path / "fleet", profiles=[("alpha", ()), ("beta", ())])
+        home = _profile(fleet, "alpha")
+
+        def detonate(pair, bank, **kwargs):
+            raise RuntimeError("handshake exploded")
+
+        monkeypatch.setattr(fh, "probe_fleet", detonate)
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            self._double_upsert(consolidator)  # must NOT raise
+            assert _fact_count(home) == 2
+            assert _conflict_rows(home) == []
+            queued = _pending_pairs(home)
+            assert [(q["fact_a_id"], q["fact_b_id"]) for q in queued] == [UPSERT_PAIR]
+        finally:
+            consolidator.close()
+
+    def test_opted_out_upsert_still_lands_one_conflict_row(self, tmp_path, monkeypatch):
+        """With the handshake disabled the queue is a pass-through: same
+        end state as the old inline path, and no audit noise."""
+        fleet = _build_fleet(
+            tmp_path / "fleet",
+            root_rows=[UPSERT_PAIR + (None,)],
+            profiles=[("alpha", ())],
+        )
+        monkeypatch.setenv(fh.HANDSHAKE_ENV, "0")
+        home = _profile(fleet, "alpha")
+
+        consolidator = VeracityConsolidator(db_path=home)
+        try:
+            self._double_upsert(consolidator)
+        finally:
+            consolidator.close()
+
+        assert len(_conflict_rows(home)) == 1
+        assert _pending_pairs(home) == []
+        assert _audit_rows(home) == []
