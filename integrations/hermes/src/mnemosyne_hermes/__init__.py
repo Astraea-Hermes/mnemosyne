@@ -1027,6 +1027,14 @@ def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
     return _coerce_optional_int(os.environ.get(key), default)
 
 
+class ToolConfigValidationError(ValueError):
+    """Raised only by _configured_tool_schemas() for a bad memory.mnemosyne.tools config.
+
+    A dedicated subclass so _maybe_retry_init() can catch this one failure by
+    provenance instead of every ValueError that initialize() might raise (#1091).
+    """
+
+
 class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     """Mnemosyne native memory — local SQLite with vector + FTS5 hybrid search."""
 
@@ -1360,7 +1368,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # Keep initialization serialized with on_session_switch(). This
             # prevents a retry that already selected session A from publishing
             # A after a concurrent switch to session B.
-            self.initialize(session_id, **kwargs)
+            try:
+                self.initialize(session_id, **kwargs)
+            except ToolConfigValidationError as e:
+                # An automatic retry must not let a validation failure (#1063)
+                # escape into the per-turn caller; report it like a direct
+                # init failure instead. Any OTHER ValueError raised during
+                # initialize() is not this provider's to swallow (#1091) and
+                # propagates to the caller like a direct initialize() would.
+                logger.warning("Mnemosyne retry init failed validation: %s", e)
+                self._init_error = e
+                self._unavailable_reason_code = "init_failed"
+                self._unavailable_reason = ""
 
     def _ensure_initialized_for_tools(self) -> None:
         """Initialize on first tool use when PluginManager never called initialize().
@@ -1645,14 +1664,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if isinstance(configured, str):
             configured = [name.strip() for name in configured.replace(",", "\n").split("\n") if name.strip()]
         if not isinstance(configured, list):
-            raise ValueError("memory.mnemosyne.tools must be a list of tool names")
+            raise ToolConfigValidationError("memory.mnemosyne.tools must be a list of tool names")
 
         available = {schema["name"]: schema for schema in ALL_TOOL_SCHEMAS}
         unknown = [name for name in configured if name not in available]
         if unknown:
             known = ", ".join(sorted(available))
             bad = ", ".join(str(name) for name in unknown)
-            raise ValueError(f"Unknown Mnemosyne tool(s) in memory.mnemosyne.tools: {bad}. Known tools: {known}")
+            raise ToolConfigValidationError(f"Unknown Mnemosyne tool(s) in memory.mnemosyne.tools: {bad}. Known tools: {known}")
         return [available[name] for name in configured]
 
     def _configured_tool_names(self) -> Set[str]:
