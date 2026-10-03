@@ -111,8 +111,28 @@ def _rollback_staged_writes(pending_ids: List[str]) -> None:
         (pending_dir / f"{pending_id}.json").unlink(missing_ok=True)
 
 
+class PendingClaimError(OSError):
+    """A pending record existed but could not be claimed into private state.
+
+    Distinct from "the record is gone" (which is a benign race, reported by
+    returning None). The caller MUST NOT report this as "already claimed": the
+    record is still there and still pending, and the real reason is an OS-level
+    failure that an operator can act on.
+    """
+
+
 def _claim_pending_record(record_path: Path) -> Optional[Path]:
-    """Atomically move a pending record into a private claim state."""
+    """Atomically move a pending record into a private claim state.
+
+    Returns None only when the record is absent (a benign race with another
+    claimer). Raises PendingClaimError when the record exists but the rename
+    fails for another reason — permission, full filesystem, cross-device link.
+
+    The call site runs outside the per-record try/except, so a propagating
+    OSError aborted the replay of every REMAINING pending record. Raising a
+    dedicated subclass lets the caller catch it, report the true cause, and
+    continue with the next record.
+    """
     claim_path = record_path.with_name(
         f".{record_path.name}.{uuid.uuid4().hex}.claim"
     )
@@ -120,6 +140,15 @@ def _claim_pending_record(record_path: Path) -> Optional[Path]:
         record_path.rename(claim_path)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        # Includes PermissionError, ENOSPC, EXDEV, EISDIR, EBUSY. The pending
+        # record is left untouched and still replayable.
+        logger.warning(
+            "Could not claim pending record %s (%s). Leaving it pending.",
+            record_path.name,
+            exc,
+        )
+        raise PendingClaimError(str(exc)) from exc
     return claim_path
 
 
@@ -4011,7 +4040,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 failed.append({"id": pid, "error": "pending record not found"})
                 continue
 
-            claim_path = _claim_pending_record(record_path)
+            try:
+                claim_path = _claim_pending_record(record_path)
+            except PendingClaimError as claim_exc:
+                # A claim that failed for an OS reason is NOT "already claimed":
+                # the record is still pending and the cause is actionable.
+                # Continue so one unclaimable record cannot abort the batch.
+                failed.append({
+                    "id": pid,
+                    "error": f"pending record not claimable: {claim_exc}",
+                })
+                continue
             if claim_path is None:
                 failed.append({"id": pid, "error": "pending record already claimed"})
                 continue
