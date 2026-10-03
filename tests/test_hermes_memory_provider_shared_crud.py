@@ -229,3 +229,49 @@ def test_invalidate_replacement_must_be_visible_in_the_routed_bank(tmp_path, mon
     ).fetchone()
     assert row[0] == surface_repl["memory_id"]
 
+
+def test_invalidate_explicit_surface_selector_beats_prefix_inference(tmp_path, monkeypatch):
+    """A bare (no sf_ prefix) id must invalidate through the surface beam when
+    the caller names the bank, and through the private bank when it does not —
+    so prefix inference can never mask a broken selector."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    provider._ensure_surface_beam()
+    target = provider._surface_beam.remember(
+        "explicit selector target", source="surface_manual", scope="global",
+    )
+    replacement = provider._surface_beam.remember(
+        "explicit selector replacement", source="surface_manual", scope="global",
+    )
+    assert not target.startswith("sf_")
+
+    # Without the selector the bare id resolves to the private bank, where it
+    # does not exist.
+    inferred = _call(provider, "mnemosyne_invalidate", {"memory_id": target})
+    assert inferred == {
+        "status": "memory_not_found", "memory_id": target, "bank": "private",
+    }
+
+    # Selector plus no replacement: the surface beam answers.
+    out = _call(provider, "mnemosyne_invalidate", {"memory_id": target, "bank": "surface"})
+    assert out == {"status": "invalidated", "memory_id": target, "bank": "surface"}
+    row = provider._surface_beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (target,),
+    ).fetchone()
+    assert row[0] is not None and row[1] is None
+
+    # Selector plus replacement: both ids resolve on the surface and chain.
+    target2 = provider._surface_beam.remember(
+        "chained selector target", source="surface_manual", scope="global",
+    )
+    out = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target2, "replacement_id": replacement, "bank": "surface",
+    })
+    assert out["status"] == "invalidated"
+    assert out["bank"] == "surface"
+    row = provider._surface_beam.conn.execute(
+        "SELECT superseded_by FROM working_memory WHERE id = ?",
+        (target2,),
+    ).fetchone()
+    assert row[0] == replacement
+
