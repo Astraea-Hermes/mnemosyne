@@ -3710,6 +3710,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         if bank not in (None, "private", "surface"):
             return json.dumps({"error": f"unknown bank: {bank}"})
+        if replacement_id == memory_id:
+            # A row can never supersede itself; core rejects this before any
+            # visibility lookup. Say so here so the reporting below stays
+            # truthful about ids that were actually looked up.
+            return json.dumps({"error": "replacement_id must differ from memory_id"})
         # Surface routing: an explicit bank= surface wins; otherwise the id
         # namespace decides. Every shared-surface row carries the generation-
         # pinned "sf_" prefix minted by _handle_shared_remember; private ids are
@@ -3736,6 +3741,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             metadata={"replacement_id": replacement_id, "invalidated": ok} if replacement_id else {"invalidated": ok},
         )
         if not ok:
+            if replacement_id and target_beam.get(memory_id) is not None:
+                # The target is visible in this bank, so the only remaining
+                # reason the invalidation can fail is that the replacement id
+                # is not visible there. Tell the caller which id to correct.
+                return json.dumps({
+                    "status": "replacement_not_found",
+                    "memory_id": memory_id,
+                    "replacement_id": replacement_id,
+                    "bank": bank,
+                })
             return json.dumps({"status": "memory_not_found", "memory_id": memory_id, "bank": bank})
         return json.dumps({"status": "invalidated", "memory_id": memory_id, "bank": bank})
 
@@ -4015,13 +4030,26 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _canonical_write_guard(self, tool_name: str) -> Optional[str]:
         """Structured error when this turn's profile does not own the bound
-        canonical identity; None when the write may proceed."""
+        canonical identity, or the turn's profile cannot be resolved at all;
+        None when the write may proceed."""
         try:
             from hermes_cli.profiles import get_active_profile_name
             turn = (get_active_profile_name() or "").strip()
         except Exception:
             turn = ""
         bound = (self._canonical_owner() or "").strip()
+        if not turn:
+            # Fail-closed (2026-09-20 incident): the guard's whole purpose is
+            # proving this turn owns the bound profile. An unresolvable turn
+            # profile proves nothing, so the canonical write is refused;
+            # reads stay ungated.
+            return json.dumps({
+                "status": "canonical_profile_unavailable",
+                "error": "canonical_profile_unavailable",
+                "tool": tool_name,
+                "hint": "active Hermes profile could not be resolved — do not "
+                        "retry from an unbound context; report to the room.",
+            })
         if turn and bound and turn != bound:
             return json.dumps({
                 "status": "canonical_owner_mismatch",
