@@ -424,3 +424,41 @@ def test_invalidate_inactive_target_stays_memory_not_found(tmp_path, monkeypatch
     out = json.loads(p._handle_invalidate(
         {"memory_id": "abc123", "replacement_id": "gone"}))
     assert out["status"] == "memory_not_found"
+
+
+def test_invalidate_active_helper_uses_sql_when_beam_has_connection(tmp_path, monkeypatch):
+    # The metadata fallback above is only half the helper. With a live
+    # connection the decision goes through core's own active-row predicate
+    # (review on #1113, second round): an EXPIRED target (valid_until in the
+    # past) must report the target even though get() still sees the row,
+    # while an ACTIVE target keeps letting the replacement take the blame.
+    p = _provider(tmp_path, monkeypatch)
+    p._beam.invalidate_result = False
+    conn = sqlite3.connect(str(tmp_path / "beam.db"))
+    for table in ("working_memory", "episodic_memory"):
+        conn.execute(
+            f"CREATE TABLE {table} (id TEXT, session_id TEXT, scope TEXT,"
+            " superseded_by TEXT, valid_until TEXT)"
+        )
+    conn.execute(
+        "INSERT INTO working_memory VALUES ('dead', 'sess', 'global', NULL, ?)",
+        ("2000-01-01T00:00:00",),
+    )
+    conn.execute(
+        "INSERT INTO working_memory VALUES ('alive', 'sess', 'global', NULL, NULL)"
+    )
+    conn.commit()
+    p._beam.conn = conn
+    # Metadata says both rows are alive; only the SQL predicate knows 'dead'
+    # expired. If the test ever silently falls back, this is the line that
+    # would flip the expired case and fail the assertion below.
+    p._beam.rows.update({"dead": {"id": "dead"}, "alive": {"id": "alive"}})
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "dead", "replacement_id": "alive"}))
+    assert out["status"] == "memory_not_found"
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "alive", "replacement_id": "gone"}))
+    assert out["status"] == "replacement_not_found"
+    conn.close()
