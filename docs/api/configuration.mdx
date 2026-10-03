@@ -163,7 +163,7 @@ This list is derived by scanning the package for `os.environ.get("MNEMOSYNE_..."
 [^llm_max_tokens]: `llm_max_tokens` -- effective default `2048`, set in `mnemosyne/core/local_llm.py`, not the ``512`` declared in `config.py`.
 [^persona_interval]: `persona_interval` -- effective default `50`, set in `mnemosyne/core/persona.py`, not the ``10`` declared in `config.py`.
 [^persona_token_cap]: `persona_token_cap` -- effective default `1500`, set in `mnemosyne/core/persona.py`, not the ``500`` declared in `config.py`.
-[^prefetch_content_chars]: `prefetch_content_chars` -- effective default `0`, set in `hermes_memory_provider/__init__.py`, `integrations/hermes/src/mnemosyne_hermes/__init__.py`, not the ``2000`` declared in `config.py`. Zero disables truncation, but a zero can still fall back to a profile limit downstream -- `0` is not always unlimited.
+[^prefetch_content_chars]: `prefetch_content_chars` -- effective default `0`, set in `integrations/hermes/src/mnemosyne_hermes/__init__.py`, `mnemosyne/core/prefetch.py`, not the ``2000`` declared in `config.py`. Zero disables truncation, but a zero can still fall back to a profile limit downstream -- `0` is not always unlimited.
 [^proactive_linking]: `proactive_linking` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^query_intent]: `query_intent` -- effective default `0`, set in `mnemosyne/core/beam.py`, not the ``true`` declared in `config.py`.
 [^shmr_harmony_threshold]: `shmr_harmony_threshold` -- effective default `0.60`, set in `mnemosyne/core/shmr.py`, not the ``0.5`` declared in `config.py`.
