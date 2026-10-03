@@ -6964,7 +6964,8 @@ class BeamMemory:
         # Working memory first (fast path)
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
-                   importance, metadata_json, veracity, created_at
+                   importance, metadata_json, veracity, created_at,
+                   author_id, author_type, scope
             FROM working_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
         """, (memory_id, self.session_id))
@@ -6980,6 +6981,9 @@ class BeamMemory:
                 "metadata": row[6],
                 "veracity": row[7],
                 "created_at": row[8],
+                "author_id": row[9],
+                "author_type": row[10],
+                "scope": row[11],
                 "memory_store": "working",
             }
 
@@ -6987,6 +6991,7 @@ class BeamMemory:
         cursor.execute("""
             SELECT id, content, source, timestamp, session_id,
                    importance, metadata_json, veracity, created_at,
+                   author_id, author_type, scope,
                    event_date, event_date_precision
             FROM episodic_memory
             WHERE id = ? AND (session_id = ? OR scope = 'global')
@@ -7003,8 +7008,11 @@ class BeamMemory:
                 "metadata": row[6],
                 "veracity": row[7],
                 "created_at": row[8],
-                "event_date": row[9],
-                "event_date_precision": row[10],
+                "author_id": row[9],
+                "author_type": row[10],
+                "scope": row[11],
+                "event_date": row[12],
+                "event_date_precision": row[13],
                 "memory_store": "episodic",
             }
 
