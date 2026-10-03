@@ -85,6 +85,9 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix.
 
 ### Fixed
+- **SHMR local LLM dispatch (#716).** The harmonization path no longer passes
+  unsupported keyword arguments to the prompt-only local LLM helper, so local
+  inference is reachable and failures remain diagnostically visible.
 
 - **An automatic init retry no longer lets a tool-name validation error escape into the turn (#1091).** `_maybe_retry_init()` called `initialize()` with no exception boundary, so a `memory.mnemosyne.tools` edit landing between the original transient-failure init and the automatic retry could raise straight out of `system_prompt_block()`, `prefetch()`, `sync_turn()` or `handle_tool_call()`. The retry path now catches it and reports it like a direct init failure; an explicit `initialize()` call still raises (#1063).
 
