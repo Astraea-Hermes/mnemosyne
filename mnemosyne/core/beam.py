@@ -6747,6 +6747,11 @@ class BeamMemory:
 
     def get_working_stats(self, author_id: str = None, author_type: str = None,
                           channel_id: str = None) -> Dict:
+        """Read filtered working totals and stored embedding/ANN presence.
+
+        Presence is not model validity, recall eligibility, or embedder health.
+        Only existing working parents count, independently in each store.
+        """
         cursor = self.conn.cursor()
         where_clauses = []
         params = []
@@ -6778,12 +6783,44 @@ class BeamMemory:
 
         cursor.execute(f"SELECT timestamp FROM working_memory{where_str} ORDER BY timestamp DESC LIMIT 1", params)
         last = cursor.fetchone()
+
+        presence_where = f"{where_str} AND" if where_str else " WHERE"
+        cursor.execute(
+            f"SELECT COUNT(*) FROM working_memory{presence_where} EXISTS ("
+            "SELECT 1 FROM memory_embeddings WHERE memory_id = working_memory.id)",
+            params,
+        )
+        embedding_rows = cursor.fetchone()[0]
+
+        # Probe this connection, not package/model availability. The general
+        # vector helper intentionally swallows errors; stats must not turn a
+        # lock, I/O failure, or corruption into an unavailable/empty index.
+        ann_index_available = True
+        try:
+            cursor.execute("SELECT 1 FROM vec_working LIMIT 0")
+        except sqlite3.OperationalError as exc:
+            if str(exc) not in {"no such table: vec_working", "no such module: vec0"}:
+                raise
+            ann_index_available = False
+
+        ann_indexed_rows = 0
+        if ann_index_available:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM working_memory{presence_where} EXISTS ("
+                "SELECT 1 FROM vec_working WHERE rowid = working_memory.rowid)",
+                params,
+            )
+            ann_indexed_rows = cursor.fetchone()[0]
+
         return {
             "total": total,
             "consolidated": consolidated,
             "unconsolidated": unconsolidated,
             "pinned_unconsolidated": pinned_unconsolidated,
             "last": last[0] if last else None,
+            "embedding_rows": embedding_rows,
+            "ann_indexed_rows": ann_indexed_rows,
+            "ann_index_available": ann_index_available,
         }
 
     def _count_unconsolidated_before(self, cutoff: str) -> int:
