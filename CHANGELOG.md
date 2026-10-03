@@ -92,6 +92,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   **Upgrade note for stores created under the old silent-384 fallback:** setting the model's true dimension can trigger the existing dimension-mismatch guard. Use the documented reindex/recovery path rather than treating the override as a one-step fix.
 
 ### Fixed
+- **`_parse_facts()` no longer returns a statement once per category it appears in.** Items across `facts`, `instructions`, `preferences` and `timelines` are deduped on trimmed, case-folded text, first occurrence winning. A supported-category payload with no usable entries now returns no facts instead of falling through to the partial-JSON fallback, which matched the schema's own key names.
+
 - **SHMR local LLM dispatch (#716).** The harmonization path no longer passes
   unsupported keyword arguments to the prompt-only local LLM helper, so local
   inference is reachable and failures remain diagnostically visible.
