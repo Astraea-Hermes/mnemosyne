@@ -7,6 +7,10 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hermes prefetch now injects raw conversation transcripts under polyphonic recall (#696, #615, #677).** The Hermes prefetch adapter drops a result when it lacks the linear per-signal fields (`keyword_score`/`fts_score`/`dense_score`) and its `score` is below 0.20. Polyphonic engine results carry only `voice_scores` provenance (RRF-ranked) and a small combined `score`, so raw `[USER]` transcript rows were silently filtered out and never surfaced in prefetch under `MNEMOSYNE_POLYPHONIC_RECALL=1`. The adapter now recognises polyphonic results (`voice_scores` with vector/graph/fact/temporal keys), lets them pass their existing lexical gate without applying the linear per-signal signal and 0.20 score floors, and uses the strongest voice contribution for ranking. The core recall pipeline is unchanged.
+
 ### Added
 
 - **`recall_with_evidence_pack()` adds opt-in supplemental recall evidence (#545).** The API preserves the normal primary ranking and returns a bounded, provenance-preserving `evidence_pack` from eligible additional sessions. Candidate retrieval is telemetry-neutral, honors recall visibility and temporal filters, excludes consolidated and synthetic rows, and never exposes the raw candidate pool.
