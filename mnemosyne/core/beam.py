@@ -11562,9 +11562,9 @@ class BeamMemory:
             SELECT count(*) AS err_count
             FROM consolidation_log
             WHERE created_at > datetime('now', '-7 days')
+              AND items_consolidated = 0
               AND (
-                  items_consolidated = 0
-                  AND summary_preview LIKE '%error%'
+                  summary_preview LIKE '%error%'
                   OR summary_preview LIKE '%fail%'
               )
         """)
