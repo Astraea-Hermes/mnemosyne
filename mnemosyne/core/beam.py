@@ -2937,36 +2937,87 @@ def _extract_and_store_facts(
     """
     try:
         from mnemosyne.core.annotations import filter_facts
-        from mnemosyne.core.extraction import extract_facts_safe
+        from mnemosyne.core.extraction import (
+            extract_facts_safe,
+            extract_triples_for_beam,
+        )
         from mnemosyne.core.filters import current_write_policy
 
         if write_policy is None:
             write_policy = current_write_policy()
         facts = extract_facts_safe(content)
-        if not facts:
+        kg_triples = extract_triples_for_beam(content)
+        if not facts and not kg_triples:
             return
 
-        # Filter to match the legacy filtering applied by TripleStore.add_facts.
-        kept = filter_facts(facts)
-        if kept:
-            beam.annotations.add_many(
-                memory_id=memory_id,
-                kind="fact",
-                values=kept,
-                source=source,
-                confidence=0.7,
-                _write_policy=write_policy,
+        if facts:
+            # Filter to match the legacy filtering applied by TripleStore.add_facts.
+            kept = filter_facts(facts)
+            if kept:
+                beam.annotations.add_many(
+                    memory_id=memory_id,
+                    kind="fact",
+                    values=kept,
+                    source=source,
+                    confidence=0.7,
+                    _write_policy=write_policy,
+                )
+
+            # ALSO store every policy-admitted fact in the facts table (new cloud
+            # extraction path), preserving the pre-E6 two-store behavior.
+            _store_facts_in_table(
+                beam, memory_id, content, source, facts, write_policy=write_policy
             )
 
-        # ALSO store every policy-admitted fact in the facts table (new cloud
-        # extraction path), preserving the pre-E6 two-store behavior.
-        _store_facts_in_table(
-            beam, memory_id, content, source, facts, write_policy=write_policy
-        )
+        # KG triples: the extraction prompt already asks for SPO "kg" items
+        # alongside the flat fact categories; extraction.py parses and
+        # validates them (non-empty fields, filler rejection, word-safe
+        # object truncation). They are written here into the bank's temporal
+        # TripleStore (`triples` table) with valid_from=now. Read path:
+        # mnemosyne_triple_query.
+        if kg_triples:
+            # Provenance is pinned: every row here is LLM-derived during
+            # consolidation, independent of the memory's own source label.
+            _store_kg_triples(beam, kg_triples, "llm_extraction")
 
-    except Exception:
-        # Fact extraction is best-effort; never fail remember() because of it
-        pass
+    except Exception as exc:
+        # Fact/KG extraction is best-effort; never fail remember() because of it
+        logger.debug("_extract_and_store_facts: non-fatal failure: %s", exc)
+
+
+def _store_kg_triples(beam: "BeamMemory", triples, source: str = "") -> int:
+    """
+    Write validated LLM-extracted KG triples into the beam's temporal
+    TripleStore (the `triples` table in the bank DB).
+
+    - valid_from = now (ISO date precision; TripleStore.query() compares
+      ISO date strings, so full timestamps would hide same-day rows).
+    - source records provenance ("llm_extraction" when unset).
+    - supersede/confidence keep TripleStore defaults (single-current-truth
+      per (subject, predicate), confidence 1.0), matching mnemosyne_triple_add.
+
+    Returns the number of triples written. Never raises: like fact
+    extraction, KG writing is best-effort and must not fail remember().
+    """
+    written = 0
+    try:
+        from mnemosyne.core.triples import TripleStore
+
+        kg = TripleStore(db_path=beam.db_path)
+        valid_from = datetime.now().isoformat()[:10]
+        for subject, predicate, obj in triples:
+            kg.add(
+                subject,
+                predicate,
+                obj,
+                valid_from=valid_from,
+                source=source or "llm_extraction",
+            )
+            written += 1
+    except Exception as exc:
+        logger.debug("_store_kg_triples: non-fatal failure (%s written): %s",
+                     written, exc)
+    return written
 
 
 def _store_facts_in_table(beam: "BeamMemory", memory_id: str,
