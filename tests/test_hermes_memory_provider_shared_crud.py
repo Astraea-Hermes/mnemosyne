@@ -179,6 +179,31 @@ def test_invalidate_missing_target_stays_memory_not_found(tmp_path, monkeypatch)
     assert result["bank"] == "private"
 
 
+def test_invalidate_inactive_target_stays_memory_not_found(tmp_path, monkeypatch):
+    """The replacement is healthy; the target is not. Re-invalidating an
+    already-superseded row must report the target, not blame the live
+    replacement (review on #1113) — invalidate() only touches ACTIVE rows."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    first = _call(provider, "mnemosyne_remember", {
+        "content": "row that gets superseded first", "source": "fact",
+    })
+    successor = _call(provider, "mnemosyne_remember", {
+        "content": "healthy successor row", "source": "fact",
+    })
+
+    retired = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": first["memory_id"],
+        "replacement_id": successor["memory_id"],
+    })
+    assert retired["status"] == "invalidated"
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": first["memory_id"],
+        "replacement_id": successor["memory_id"],
+    })
+    assert result["status"] == "memory_not_found"
+
+
 def test_invalidate_rejects_self_replacement(tmp_path, monkeypatch):
     provider, _ = _provider(tmp_path, monkeypatch)
     stored = _call(provider, "mnemosyne_remember", {

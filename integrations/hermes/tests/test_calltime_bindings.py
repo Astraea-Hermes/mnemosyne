@@ -408,3 +408,19 @@ def test_invalidate_reports_missing_replacement(tmp_path, monkeypatch):
     out = json.loads(p._handle_invalidate(
         {"memory_id": "absent", "replacement_id": "gone"}))
     assert out["status"] == "memory_not_found"
+
+
+def test_invalidate_inactive_target_stays_memory_not_found(tmp_path, monkeypatch):
+    # get() returns superseded and expired rows too, so a bare existence
+    # check would let an already-dead target wrongly blame a healthy
+    # replacement (review on #1113). Only an ACTIVE target makes the
+    # replacement the suspect. The stand-in beam carries no live connection,
+    # so the active-state helper falls back to the metadata get() reports.
+    p = _provider(tmp_path, monkeypatch)
+    p._beam.invalidate_result = False
+    p._beam.rows["abc123"] = {"id": "abc123", "superseded_by": "earlier"}
+    p._beam.rows["gone"] = {"id": "gone"}
+
+    out = json.loads(p._handle_invalidate(
+        {"memory_id": "abc123", "replacement_id": "gone"}))
+    assert out["status"] == "memory_not_found"
