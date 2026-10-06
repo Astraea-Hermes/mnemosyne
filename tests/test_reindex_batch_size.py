@@ -146,6 +146,36 @@ def test_core_invalid_batch_precedes_sql(batch_size, dry_run):
         )
 
 
+class _IndexSize:
+    def __init__(self, value):
+        self.value = value
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        return self.value
+
+
+class _IntOnlySize:
+    def __int__(self):
+        return 8
+
+
+@pytest.mark.parametrize(
+    "batch_size", [_IndexSize(0), _IndexSize(-1), _IndexSize(8.0), _IntOnlySize()]
+)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_core_invalid_integral_protocol_precedes_sql(batch_size, dry_run):
+    class UntouchedConnection:
+        def __getattr__(self, name):
+            pytest.fail(f"connection touched before validation: {name}")
+
+    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+        beam.reindex_vectors(
+            UntouchedConnection(), batch_size=batch_size, dry_run=dry_run
+        )
+
+
 class _Response:
     def __init__(self, vectors):
         self.body = json.dumps({"data": [{"embedding": v} for v in vectors]}).encode()
@@ -305,6 +335,37 @@ def test_capped_api_default_fails_atomically_then_cli_batch8_maps_every_row(
     assert dict(after["binary"]) == {
         key: beam._mib(np.asarray(vectors[text])) for key, text in episodic.items()
     }
+
+
+@pytest.mark.parametrize("kind", ["numpy", "index"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_core_accepts_integral_protocol(tmp_path, monkeypatch, kind, dry_run):
+    memory, np, vectors = _source_store(tmp_path)
+    batch_size = np.int64(8) if kind == "numpy" else _IndexSize(8)
+    requests = _capped_transport(monkeypatch, vectors)
+    db = tmp_path / "target.db"
+    before = _snapshot(db)
+    plan = beam.reindex_vectors(memory.conn, batch_size=batch_size, dry_run=dry_run)
+    assert (plan["working_memory"], plan["episodic_memory"]) == (65, 19)
+    if kind == "index":
+        assert batch_size.calls == 1
+    after = _snapshot(db)
+    if dry_run:
+        assert requests == []
+        assert after == before
+    else:
+        assert [len(batch) for batch in requests] == [8] * 8 + [1, 8, 8, 3]
+        assert len(after["vec_working"]) == 65
+        assert len(after["vec_episodes"]) == 19
+        assert after["marker"] & beam._VEC_NORM_BIT
+        working = dict(memory.conn.execute("SELECT id, content FROM working_memory"))
+        assert {key: json.loads(value) for key, value, _model in after["json"]} == {
+            key: vectors[text] for key, text in working.items()
+        }
+        episodic = dict(memory.conn.execute("SELECT id, content FROM episodic_memory"))
+        assert dict(after["binary"]) == {
+            key: beam._mib(np.asarray(vectors[text])) for key, text in episodic.items()
+        }
 
 
 def test_core_positive_dry_run_does_not_write(tmp_path):
