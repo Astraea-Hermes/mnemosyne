@@ -522,3 +522,69 @@ def test_invalidate_failed_activity_probe_with_real_get_shape_falls_closed(tmp_p
     ).fetchone()
     assert row[1] is None  # no store mutation
     real_beam.conn.close()
+
+
+def test_invalidate_parity_on_west_of_utc_host(tmp_path, monkeypatch):
+    # Review on #1113 (fourth round): the activity check in this provider
+    # and core's replacement-path now must compare valid_until against UTC,
+    # not host-local wall time. On a west-of-UTC host the naive-local clock
+    # trails UTC stamps by the host offset, so an expiry inside that window
+    # read as active: an expired target wrongly blamed a healthy
+    # replacement. Pin the whole contract under TZ=America/Los_Angeles.
+    import os
+    import time
+    from datetime import timezone
+
+    from mnemosyne.core.beam import BeamMemory
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset() unavailable on this platform")
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        p = _provider(tmp_path, monkeypatch)
+        monkeypatch.setattr(mnemosyne_hermes, "_get_beam_class", lambda: BeamMemory)
+        real_beam = BeamMemory(session_id="west-skew", db_path=tmp_path / "beam.db")
+        p._beam = real_beam
+
+        target = real_beam.remember("expired target west skew", source="fact")
+        replacement = real_beam.remember("healthy replacement west skew", source="fact")
+        # Expired ~1h ago in UTC terms; yesterday on the local wall clock —
+        # inside the skew window a local-naive comparison calls "active".
+        recent_past = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).replace(tzinfo=None).isoformat()
+        real_beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (recent_past, target),
+        )
+        real_beam.conn.commit()
+
+        out = json.loads(p._handle_invalidate({
+            "memory_id": target, "replacement_id": replacement,
+        }))
+        assert out["status"] == "memory_not_found", (
+            "an expired target must not be read as active on a "
+            "west-of-UTC host and blame the replacement")
+
+        # Happy path on the same clock: active target + active replacement
+        # must invalidate, and core must stamp the expiry aware-UTC (the
+        # no-replacement path's shape).
+        fresh_a = real_beam.remember("active target west skew", source="fact")
+        fresh_b = real_beam.remember("active replacement west skew", source="fact")
+        out = json.loads(p._handle_invalidate({
+            "memory_id": fresh_a, "replacement_id": fresh_b,
+        }))
+        assert out["status"] == "invalidated"
+        row = real_beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?", (fresh_a,),
+        ).fetchone()
+        assert datetime.fromisoformat(row[0]).utcoffset() == timedelta(0)
+        real_beam.conn.close()
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time.tzset()

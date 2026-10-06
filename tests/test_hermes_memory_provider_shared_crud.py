@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from hermes_memory_provider import MnemosyneMemoryProvider
 
@@ -390,4 +392,84 @@ def test_invalidate_explicit_surface_selector_beats_prefix_inference(tmp_path, m
         (target2,),
     ).fetchone()
     assert row[0] == replacement
+
+
+def test_invalidate_parity_on_west_of_utc_host(tmp_path, monkeypatch):
+    """Review on #1113 (fourth round): the activity checks in both providers
+    and in core's replacement path must compare ``valid_until`` against UTC,
+    never host-local wall time.
+
+    On a west-of-UTC host the local-naive clock trails UTC stamps by the
+    host offset, so an expiry inside that window (yesterday 23:00Z is
+    expired for hours) still compared "active" against local now. That
+    turned a correctly rejected invalidation of an expired target into a
+    wrong ``replacement_not_found`` — and an active replacement could be
+    judged not-active by the same skew. This test pins the whole contract
+    under TZ=America/Los_Angeles: the expired target stays
+    ``memory_not_found``, an active pair invalidates, and the stamp core
+    writes is aware UTC.
+    """
+    import os
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset() unavailable on this platform")
+    original_tz = os.environ.get("TZ")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    try:
+        provider, _ = _provider(tmp_path, monkeypatch)
+        expired = _call(provider, "mnemosyne_remember", {
+            "content": "expired target for UTC parity", "source": "fact",
+        })
+        healthy = _call(provider, "mnemosyne_remember", {
+            "content": "healthy replacement for UTC parity", "source": "fact",
+        })
+        # Expired ~1h ago in UTC terms, but yesterday on a west-of-UTC wall
+        # clock — inside the skew window that used to flip the verdict.
+        recent_past = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).replace(tzinfo=None).isoformat()
+        provider._beam.conn.execute(
+            "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+            (recent_past, expired["memory_id"]),
+        )
+        provider._beam.conn.commit()
+
+        result = _call(provider, "mnemosyne_invalidate", {
+            "memory_id": expired["memory_id"],
+            "replacement_id": healthy["memory_id"],
+        })
+        assert result["status"] == "memory_not_found", (
+            "on a west-of-UTC host an expired target must never be read "
+            "as active and blame a healthy replacement")
+
+        # And the happy path still works on the same clock: an active
+        # target + active replacement must invalidate (a local-naive
+        # replacement check could reject it as not-yet-active).
+        fresh_a = _call(provider, "mnemosyne_remember", {
+            "content": "active target west skew", "source": "fact",
+        })
+        fresh_b = _call(provider, "mnemosyne_remember", {
+            "content": "active replacement west skew", "source": "fact",
+        })
+        result = _call(provider, "mnemosyne_invalidate", {
+            "memory_id": fresh_a["memory_id"],
+            "replacement_id": fresh_b["memory_id"],
+        })
+        assert result["status"] == "invalidated"
+        row = provider._beam.conn.execute(
+            "SELECT valid_until FROM working_memory WHERE id = ?",
+            (fresh_a["memory_id"],),
+        ).fetchone()
+        stamped = datetime.fromisoformat(row[0])
+        assert stamped.utcoffset() == timedelta(0), (
+            "core's replacement path must stamp aware UTC, like the "
+            "no-replacement path already does")
+    finally:
+        if original_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", original_tz)
+        time.tzset()
 

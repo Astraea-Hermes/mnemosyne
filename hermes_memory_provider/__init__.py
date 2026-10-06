@@ -3217,7 +3217,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         (memory_not_found) rather than blaming a healthy replacement.
         """
         try:
-            now = datetime.now().isoformat()
+            now = datetime.now(timezone.utc).isoformat()
             cursor = beam.conn.cursor()
             for table in ("working_memory", "episodic_memory"):
                 cursor.execute(
