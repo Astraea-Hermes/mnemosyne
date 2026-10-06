@@ -1315,7 +1315,7 @@ def cmd_reindex(args):
     """Rebuild vector indexes from source text with the active embedding model.
 
     Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME]
-                              [--dry-run] [--yes] [--no-backup]
+                              [--batch-size N] [--dry-run] [--yes] [--no-backup]
 
     Use after changing the embedding model/dimension. Synchronous and blocking —
     re-embeds working + episodic memory, so it can take minutes on a large DB.
@@ -1323,11 +1323,12 @@ def cmd_reindex(args):
     """
     usage = (
         "Usage: mnemosyne reindex [--db PATH | --bank NAME] [--model NAME] "
-        "[--dry-run] [--yes] [--no-backup]"
+        "[--batch-size N] [--dry-run] [--yes] [--no-backup]"
     )
     db_override = None
     bank_override = None
     model_override = None
+    batch_size = 64
     dry_run = False
     assume_yes = False
     no_backup = False
@@ -1340,6 +1341,10 @@ def cmd_reindex(args):
             bank_override, i = _require_value(args, i, "--bank", lambda value, _name: value)
         elif arg == "--model":
             model_override, i = _require_value(args, i, "--model", lambda value, _name: value)
+        elif arg == "--batch-size":
+            batch_size, i = _require_value(args, i, "--batch-size", _parse_int)
+            if batch_size <= 0:
+                _fail("batch-size must be a positive integer")
         elif arg == "--dry-run":
             dry_run = True
             i += 1
@@ -1371,7 +1376,7 @@ def cmd_reindex(args):
     beam = BeamMemory(db_path=str(db_path))
 
     if dry_run:
-        plan = reindex_vectors(beam.conn, dry_run=True)
+        plan = reindex_vectors(beam.conn, batch_size=batch_size, dry_run=True)
         print(f"Reindex plan (dry run -- nothing written), db: {db_path}")
         for key in ("model", "dim", "vec_type", "sqlite_vec",
                     "working_memory", "episodic_memory"):
@@ -1409,7 +1414,7 @@ def cmd_reindex(args):
         print(f"  {store}: {done}/{total}", flush=True)
 
     try:
-        result = reindex_vectors(beam.conn, progress=_progress)
+        result = reindex_vectors(beam.conn, batch_size=batch_size, progress=_progress)
     except Exception as e:
         _fail(str(e))
 
@@ -2014,8 +2019,9 @@ def run_cli():
         print("  import <file.json>                     Import memories")
         print("  import-hindsight <file|url> [bank]     Import Hindsight memories")
         print("  bank list|create|delete [name]         Manage memory banks")
-        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]")
+        print("  reindex [--db PATH|--bank NAME] [--model NAME] [--batch-size N] [--dry-run] [--yes] [--no-backup]")
         print("                                      Rebuild vector indexes with the active model")
+        print("                                      --batch-size: positive inputs per request (default 64)")
         print("  backup [output_dir]                    Create database backup")
         print("  restore <backup.db.gz>                 Restore from backup")
         print("  verify [db_path] [--quick]             Verify database integrity")
