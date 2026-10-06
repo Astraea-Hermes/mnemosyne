@@ -3210,8 +3210,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         expired, while BeamMemory.get() happily returns such rows too — so a
         failed invalidation can only blame the replacement when the target
         itself still passes core's visibility predicate. Mirrors exactly that
-        predicate. Test stand-ins without a live connection degrade to the
-        metadata get() reports.
+        predicate. When the query cannot run, only a get() row that POSITIVELY
+        declares both status fields unset counts as active: the real
+        BeamMemory.get() shape omits superseded_by/valid_until entirely, and
+        absent fields mean UNKNOWN, not active. An unknown state fails closed
+        (memory_not_found) rather than blaming a healthy replacement.
         """
         try:
             now = datetime.now().isoformat()
@@ -3228,13 +3231,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     return True
             return False
         except Exception:
+            # Degraded path — see the contract above: activity is only
+            # claimed when the row declares it, never inferred from absent
+            # fields (review on #1113, third round).
             try:
                 row = beam.get(memory_id)
             except Exception:
                 return False
             if row is None:
                 return False
-            return not row.get("superseded_by") and not row.get("valid_until")
+            if "superseded_by" not in row or "valid_until" not in row:
+                return False
+            return not row["superseded_by"] and not row["valid_until"]
 
     def _handle_invalidate(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")

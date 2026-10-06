@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -234,6 +235,64 @@ def test_invalidate_expired_target_stays_memory_not_found(tmp_path, monkeypatch)
         "replacement_id": replacement["memory_id"],
     })
     assert result["status"] == "memory_not_found"
+
+
+def test_invalidate_failed_activity_probe_with_real_get_shape_falls_closed(tmp_path, monkeypatch):
+    """Review on #1113 (reproduced by the maintainer): with a REAL expired
+    target, a healthy replacement, and a failing activity SELECT, the
+    degraded fallback consulted ``beam.get()`` — whose real row shape does
+    NOT include superseded_by/valid_until at all. Absent fields used to be
+    read as 'active', so the answer wrongly blamed the healthy replacement
+    (replacement_not_found) instead of the expired target. A get() row that
+    does not positively declare its status means UNKNOWN, and unknown fails
+    closed to memory_not_found: the replacement is only blamed when the
+    target's activity is established. The store must stay untouched."""
+    provider, _ = _provider(tmp_path, monkeypatch)
+    target = _call(provider, "mnemosyne_remember", {
+        "content": "expired target behind a broken probe", "source": "fact",
+    })
+    replacement = _call(provider, "mnemosyne_remember", {
+        "content": "healthy replacement row", "source": "fact",
+    })
+    past = (datetime.now() - timedelta(days=1)).isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (past, target["memory_id"]),
+    )
+    provider._beam.conn.commit()
+
+    class _ProbeDownBeam:
+        """Same store — only the helper's activity query cannot run. get()
+        stays the real BeamMemory method, so the row shape is real."""
+        def __init__(self, real):
+            self._real = real
+
+        @property
+        def conn(self):
+            raise sqlite3.OperationalError("activity probe unavailable")
+
+        def get(self, memory_id):
+            return self._real.get(memory_id)
+
+        def invalidate(self, memory_id, replacement_id=None):
+            return self._real.invalidate(memory_id, replacement_id=replacement_id)
+
+    orig = provider._invalidate_target_active
+    monkeypatch.setattr(
+        provider, "_invalidate_target_active",
+        lambda beam, memory_id: orig(_ProbeDownBeam(beam), memory_id))
+
+    result = _call(provider, "mnemosyne_invalidate", {
+        "memory_id": target["memory_id"],
+        "replacement_id": replacement["memory_id"],
+    })
+    assert result["status"] == "memory_not_found", (
+        "an unknown target state must never blame the replacement")
+    row = provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (target["memory_id"],),
+    ).fetchone()
+    assert row[1] is None  # no store mutation
 
 
 def test_invalidate_rejects_self_replacement(tmp_path, monkeypatch):
