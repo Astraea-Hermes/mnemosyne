@@ -431,6 +431,74 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return response
 
 
+# --- fleet durability features (v0.7.6; re-lands the 2026-10-05 thought-tier
+# semantics verbatim; spec + carrier: canonical slot
+# governance/journal-repository-durability v4). Applied to the MCP/standalone
+# lane too, because an unpatched copy is how carrier multiplicity was born.
+_PINNABLE_HEADS = ("result", "verdict", "correction", "question",
+                   "observation", "conflict", "goal", "idea", "note",
+                   "record", "answer", "memory", "probe", "measurement")
+_PINNABLE_SEATS = ("astraea", "hermes", "keeper", "scales", "senses", "why", "I")
+_NN_SUFFIX_RE = None  # compiled lazily below
+
+
+def _pin_head_is_substantive(content: str) -> bool:
+    """True when a fresh row's head-token is substantive (either grammar).
+    Plumbing heads, bare INTEGRATION-WAKE receipts and '?!' dissent plants
+    stay trimmable by design; the beat sweep (wake rule 3c) is the belt for
+    writers that bypass every tool path."""
+    toks = (content or "").strip().split(None, 2)
+    if not toks:
+        return False
+    first = toks[0].rstrip(":|")
+    if first in _PINNABLE_HEADS:
+        return True
+    if len(toks) >= 2 and first in _PINNABLE_SEATS:
+        return toks[1].rstrip(":|") in _PINNABLE_HEADS
+    return False
+
+
+def _norm_slot(name) -> str:
+    """Canonical slot key used by the near-name guard: case/space-folded, then
+    the qualifier tail (-design/-pattern/-rule/...) and a trailing -vN removed."""
+    import re
+    global _NN_SUFFIX_RE
+    if _NN_SUFFIX_RE is None:
+        _NN_SUFFIX_RE = re.compile(r"-(design|pattern|rule|policy|plan|draft|doc|slot)$")
+    s = re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-")
+    s = _NN_SUFFIX_RE.sub("", s)
+    return re.sub(r"-v\d+$", "", s)
+
+
+def _canonical_near_name_guard(store, owner_id: str, category: str, name: str):
+    """Refuse a NEW (category, name) that normalizes onto an incumbent slot.
+    Exact-name supersession untouched. Fail-open: a guard error never vetoes
+    a write. Returns None to allow, or a refusal dict."""
+    if not (category and name):
+        return None
+    try:
+        names = {str(r["name"]) for r in store.list(owner_id, category) if r.get("name")}
+        if name in names:
+            return None
+        mine = _norm_slot(name)
+        twins = [n for n in sorted(names) if _norm_slot(n) == mine and n != name]
+        if twins:
+            return {
+                "status": "canonical_near_name",
+                "error": "canonical_near_name",
+                "category": category,
+                "name": name,
+                "incumbent": twins[0],
+                "hint": (f"slot '{twins[0]}' exists in category '{category}' and "
+                         "normalizes to the same key. Update THAT slot in place "
+                         "(same category+name) — or pick a genuinely distinct name "
+                         "if these are different facts. Never write the twin."),
+            }
+    except Exception:
+        return None
+    return None
+
+
 def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_shared_remember tool call."""
     content = (arguments.get("content") or "").strip()
@@ -448,6 +516,17 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     surface_beam = _create_surface_instance()
     import hashlib
+    veracity = None
+    try:
+        from mnemosyne.core.veracity_consolidation import clamp_veracity
+        veracity = clamp_veracity(arguments.get("veracity"), context="mcp_shared_remember")
+    except Exception:
+        veracity = "unknown"
+    pin = _pin_head_is_substantive(content)
+    _author = {}
+    _prof = (arguments.get("writer_profile") or "").strip()
+    if _prof:
+        _author = {"author_id": _prof, "author_type": "profile"}
     normalized = " ".join(str(content).lower().split())
     content_hash = hashlib.sha256(f"surface:v1:{normalized}".encode("utf-8")).hexdigest()[:24]
     prefixes = ("surface meta:", "surface preference:", "surface correction:", "surface identity:", "surface fact:")
@@ -467,8 +546,20 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         metadata=meta,
         scope="global",
         memory_id=stable_id,
+        veracity=veracity,
         _write_policy_content=content,
+        **_author,
     )
+    _pin_applied = None
+    if pin and memory_id is not None:
+        try:
+            _c = surface_beam.conn.execute(
+                "UPDATE working_memory SET pinned = 1 WHERE id = ?", (memory_id,)
+            )
+            surface_beam.conn.commit()
+            _pin_applied = _c.rowcount > 0
+        except Exception:
+            _pin_applied = False
 
     if memory_id is None:
         return {"status": "filtered_shared", "kind": kind}
@@ -479,6 +570,8 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         "content_preview": surface_content[:120],
         "shared_db": str(_shared_db_path()),
         "kind": kind,
+        "veracity": veracity,
+        "pinned": _pin_applied,
     }
 
 
@@ -905,6 +998,9 @@ def _handle_remember_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
         store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
 
     owner_id = _canonical_owner(arguments)
+    _refuse = _canonical_near_name_guard(store, owner_id, category, name)
+    if _refuse:
+        return _refuse
     row = store.remember(
         owner_id, category, name, body,
         source=arguments.get("source", "canonical_tool"),

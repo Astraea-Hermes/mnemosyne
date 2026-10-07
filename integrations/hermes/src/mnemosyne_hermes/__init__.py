@@ -3549,6 +3549,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "content is required"})
         if content.startswith("[USER]") or content.startswith("[ASSISTANT]"):
             return json.dumps({"error": "raw conversation content is not allowed in shared memory"})
+        _kind_head = (content or "").strip()
+        _toks = _kind_head.split(None, 2)
+        _first_tok = _toks[0].rstrip(":|") if _toks else ""
+        _PINNABLE_HEADS = ("result", "verdict", "correction", "question",
+                           "observation", "conflict", "goal", "idea", "note",
+                           "record", "answer", "memory", "probe", "measurement")
+        _pin_new = _first_tok in _PINNABLE_HEADS
+        # Writer-first grammar ("astraea: conflict ...", "keeper: result ...")
+        # carries the kind in the SECOND token — same class, same durability
+        # (seen unpinned post-patch: rows 1121/1135 via direct-sqlite writers;
+        # the beat sweep rule 3c is the belt for anything that bypasses this
+        # tool path entirely).
+        if not _pin_new and len(_toks) >= 2 and _first_tok.rstrip(":|") in (
+                "astraea", "hermes", "keeper", "scales", "senses", "why", "I"):
+            _pin_new = _toks[1].rstrip(":|") in _PINNABLE_HEADS
         kind = (args.get("kind") or "meta").strip().lower()
         if kind not in {"meta", "preference", "correction", "identity"}:
             return json.dumps({"error": "kind must be one of: meta, preference, correction, identity"})
@@ -3611,10 +3626,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
+        # Apply the thought-tier pin for freshly written substantive rows (and
+        # re-asserted rows via the content-dedupe path — pin is monotone, the
+        # UPDATE never lifts a pin). Loud-fail-soft: a pin write that errors
+        # must not veto the memory itself; the row landed, only its trim
+        # exemption is at stake, and the failure is disclosed in the result.
+        _pin_applied = None
+        if _pin_new and self._surface_beam is not None:
+            try:
+                _pin_cur = self._surface_beam.conn.execute(
+                    "UPDATE working_memory SET pinned = 1 WHERE id = ?",
+                    (memory_id,),
+                )
+                self._surface_beam.conn.commit()
+                _pin_applied = _pin_cur.rowcount > 0
+            except Exception as _pe:
+                _pin_applied = False
         self._audit_event(
             "shared_remember", memory_id=memory_id, bank="surface",
             scope="global", source_tool="mnemosyne_shared_remember",
-            metadata={"kind": kind, "existing": bool(existing_id)},
+            metadata={"kind": kind, "existing": bool(existing_id),
+                      "pinned": _pin_applied},
         )
         return json.dumps({
             "status": "existing_shared" if existing_id else "stored_shared",
@@ -3623,6 +3655,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "shared_db": str(self._shared_surface_path or ""),
             "kind": kind,
             "veracity": veracity,
+            "pinned": _pin_applied,
         })
 
     def _handle_shared_recall(self, args: Dict[str, Any]) -> str:
@@ -4161,6 +4194,39 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             from mnemosyne.core.canonical import CanonicalStore
             store = CanonicalStore(db_path=self._beam.db_path, conn=self._beam.conn)
             self._beam.canonical = store
+        # Near-name guard (astraea hand 2026-10-05 23:5x EDT, at @user's
+        # endorsement; class born tonight when society-heartbeat-design was
+        # written beside society-heartbeat and only a manual sweep caught it):
+        # a NEW (category, name) slot whose name is a near-variant of an
+        # existing slot in the same category is REFUSED, with the incumbent
+        # named. Supersession should be an act on the existing slot, not the
+        # creation of its twin; if the distinction is real, choose a clearly
+        # different name. Exact-name writes keep in-place supersession
+        # semantics untouched. Fail-open: a guard error never vetoes a write.
+        if category and name:
+            try:
+                _sibs = [r for r in store.list(owner_id, category) if r.get("name")]
+                _names = {str(r["name"]) for r in _sibs}
+                if name not in _names:
+                    import re as _re_nn
+                    def _norm_slot(s: str) -> str:
+                        s = str(s).lower()
+                        s = _re_nn.sub(r"[^a-z0-9]+", "-", s).strip("-")
+                        s = _re_nn.sub(r"-(design|pattern|rule|policy|plan|draft|doc|slot)$", "", s)
+                        return _re_nn.sub(r"-v\d+$", "", s)
+                    _mine = _norm_slot(name)
+                    _twins = [n for n in sorted(_names) if _norm_slot(n) == _mine and n != name]
+                    if _twins:
+                        return json.dumps({
+                            "status": "canonical_near_name",
+                            "error": "canonical_near_name",
+                            "category": category,
+                            "name": name,
+                            "incumbent": _twins[0],
+                            "hint": f"slot '{_twins[0]}' exists in category '{category}' and normalizes to the same key. Update THAT slot in place (same category+name) — or pick a genuinely distinct name if these are different facts. Never write the twin.",
+                        })
+            except Exception:
+                pass
         try:
             from hermes_cli.profiles import get_active_profile_name
             from hermes_constants import get_hermes_home
