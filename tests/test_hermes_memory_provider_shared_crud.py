@@ -394,6 +394,51 @@ def test_invalidate_explicit_surface_selector_beats_prefix_inference(tmp_path, m
     assert row[0] == replacement
 
 
+def test_activity_probe_judges_offset_bearing_expiry(tmp_path, monkeypatch):
+    """Review on #1113 (fifth round): the probe mirrors core's active-row
+    predicate, so it must read a stored offset-bearing expiry the way every
+    julianday-based surface does. A legacy/imported row carrying
+    ``...T18:30:00+07:00`` (11:30Z, already past) sorts lexically AFTER an
+    aware-UTC now string; the old text comparison called that dead row
+    active, which let a failed invalidation wrongly blame a healthy
+    replacement. The probe is exercised directly here because the end-to-end
+    status also depends on core's own predicate (fixed in the companion
+    UTC/expiry PR).
+    """
+    provider, _ = _provider(tmp_path, monkeypatch)
+    dead = _call(provider, "mnemosyne_remember", {
+        "content": "offset-expired target for probe", "source": "fact",
+    })
+    now = datetime.now(timezone.utc)
+    stored = (now - timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=7))).isoformat()
+    # Fixture sanity: this value genuinely misleads a lexical comparison.
+    assert stored > now.isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (stored, dead["memory_id"]),
+    )
+    provider._beam.conn.commit()
+    assert provider._invalidate_target_active(provider._beam, dead["memory_id"]) is False, (
+        "an expiry already past in UTC must not read as active")
+
+    # A future expiry stored at UTC-05 sorts lexically BEFORE aware-UTC now
+    # (misleading the other way) but is chronologically active.
+    alive = _call(provider, "mnemosyne_remember", {
+        "content": "future-offset row for probe", "source": "fact",
+    })
+    stored_future = (now + timedelta(hours=1)).astimezone(
+        timezone(timedelta(hours=-5))).isoformat()
+    assert stored_future < now.isoformat()
+    provider._beam.conn.execute(
+        "UPDATE working_memory SET valid_until = ? WHERE id = ?",
+        (stored_future, alive["memory_id"]),
+    )
+    provider._beam.conn.commit()
+    assert provider._invalidate_target_active(provider._beam, alive["memory_id"]) is True, (
+        "a chronologically future expiry must read as active")
+
+
 def test_invalidate_parity_on_west_of_utc_host(tmp_path, monkeypatch):
     """Review on #1113 (fourth round): the activity checks in both providers
     and in core's replacement path must compare ``valid_until`` against UTC,

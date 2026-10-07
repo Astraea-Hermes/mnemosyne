@@ -3723,7 +3723,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     f"SELECT 1 FROM {table} "
                     "WHERE id = ? AND (session_id = ? OR scope = 'global') "
                     "AND superseded_by IS NULL "
-                    "AND (valid_until IS NULL OR valid_until > ?) LIMIT 1",
+                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) LIMIT 1",
                     (memory_id, getattr(beam, "session_id", None), now),
                 )
                 if cursor.fetchone() is not None:

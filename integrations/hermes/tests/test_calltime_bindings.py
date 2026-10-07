@@ -524,6 +524,53 @@ def test_invalidate_failed_activity_probe_with_real_get_shape_falls_closed(tmp_p
     real_beam.conn.close()
 
 
+def test_activity_probe_judges_offset_bearing_expiry(tmp_path, monkeypatch):
+    # Review on #1113 (fifth round): the probe mirrors core's active-row
+    # predicate and must read stored offset-bearing expiries the way every
+    # julianday-based surface does. A legacy/imported row carrying
+    # ...T18:30:00+07:00 (11:30Z, already past) sorts lexically AFTER an
+    # aware-UTC now string; the old text comparison called that dead row
+    # active and let a failed invalidation wrongly blame a healthy
+    # replacement. Same hand-built-connection pattern as the SQL-predicate
+    # test above; the probe is exercised directly because the end-to-end
+    # status also depends on core's own predicate (fixed in the companion
+    # UTC/expiry PR).
+    from datetime import timezone
+
+    p = _provider(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(tmp_path / "beam.db"))
+    for table in ("working_memory", "episodic_memory"):
+        conn.execute(
+            f"CREATE TABLE {table} (id TEXT, session_id TEXT, scope TEXT,"
+            " superseded_by TEXT, valid_until TEXT)"
+        )
+    now = datetime.now(timezone.utc)
+    dead = (now - timedelta(minutes=30)).astimezone(
+        timezone(timedelta(hours=7))).isoformat()
+    alive = (now + timedelta(hours=1)).astimezone(
+        timezone(timedelta(hours=-5))).isoformat()
+    # Fixture sanity: both values genuinely mislead a lexical comparison,
+    # in opposite directions.
+    assert dead > now.isoformat()
+    assert alive < now.isoformat()
+    conn.execute(
+        "INSERT INTO working_memory VALUES ('dead', 'sess', 'global', NULL, ?)",
+        (dead,),
+    )
+    conn.execute(
+        "INSERT INTO working_memory VALUES ('alive', 'sess', 'global', NULL, ?)",
+        (alive,),
+    )
+    conn.commit()
+    p._beam.conn = conn
+
+    assert p._invalidate_target_active(p._beam, "dead") is False, (
+        "an expiry already past in UTC must not read as active")
+    assert p._invalidate_target_active(p._beam, "alive") is True, (
+        "a chronologically future expiry must read as active")
+    conn.close()
+
+
 def test_invalidate_parity_on_west_of_utc_host(tmp_path, monkeypatch):
     # Review on #1113 (fourth round): the activity check in this provider
     # and core's replacement-path now must compare valid_until against UTC,
