@@ -5597,7 +5597,6 @@ _VERACITY_BY_SOURCE = {
     "verification": "tool",
     "document": "imported",
 }
->>>>>>> b9519ed2 (feat(write-provenance): veracity by channel, author at write, trim tombstones)
 
 
 class BeamMemory:
