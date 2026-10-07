@@ -602,6 +602,15 @@ def test_resolver_scan_uses_utc_now_under_non_utc_host(temp_db, monkeypatch, dis
     monkeypatch.setenv("TZ", "America/Los_Angeles")
     try:
         time.tzset()
+        # The fixture is only meaningful if the host clock really moved west
+        # of UTC — on a UTC-parked environment (e.g. missing tzdata, where
+        # tzset() silently keeps UTC) the old naive-local comparison would
+        # pass untested, so skip rather than claim a green (review on #1142).
+        host_offset = datetime.now().astimezone().utcoffset()
+        if host_offset is None or host_offset >= timedelta(0):
+            pytest.skip(
+                f"TZ=America/Los_Angeles did not take effect (offset {host_offset}); "
+                "this test needs a west-of-UTC host clock to be non-vacuous")
         monkeypatch.setenv("MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION", "1")
         A = BeamMemory(session_id="tW", db_path=temp_db)
         expired = A.remember("[USER] recently expired global", source="conversation",

@@ -1292,20 +1292,36 @@ class TestWorkingMemory:
         ).fetchone()
         assert row[0] is None, "the original memory must not be superseded"
 
-    def test_invalidate_rejects_equal_instant(self, temp_db):
+    def test_invalidate_rejects_equal_instant(self, temp_db, monkeypatch):
         """Review on #1113: eligibility is a strict ``>`` — a row whose
         expiry is exactly ``now`` is expired, not still active.
+
+        The clock is frozen at the stored instant for the invalidation call,
+        so the two operands are the same instant to the microsecond; a
+        ``>=`` regression would accept the supersession and fail here
+        (review on #1142: without freezing, the captured ``at_now`` drifts
+        microseconds ahead of ``invalidate``'s own ``now`` and the equality
+        boundary is not actually pinned).
         """
+        import datetime as _dt
+
+        frozen = _dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+        class _FrozenDatetime(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen if tz is not None else frozen.replace(tzinfo=None)
+
         beam = BeamMemory(session_id="s1", db_path=temp_db)
         target = beam.remember("equal-instant target", source="test", importance=0.9)
         replacement = beam.remember("healthy replacement", source="test", importance=0.9)
-        at_now = datetime.now(timezone.utc).isoformat()
         beam.conn.execute(
             "UPDATE working_memory SET valid_until = ? WHERE id = ?",
-            (at_now, target),
+            (frozen.isoformat(), target),
         )
         beam.conn.commit()
 
+        monkeypatch.setattr(beam_module, "datetime", _FrozenDatetime)
         assert beam.invalidate(target, replacement_id=replacement) is False
         row = beam.conn.execute(
             "SELECT superseded_by FROM working_memory WHERE id = ?", (target,)
