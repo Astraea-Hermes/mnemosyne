@@ -211,6 +211,23 @@ def test_cost_capable_calls_stop_before_core(provider, guard, dry_run):
     assert snapshot(provider) == before
 
 
+@pytest.mark.parametrize("guard", ["exhausted", "cron"])
+@pytest.mark.parametrize("args", [{}, {"dry_run": False}, {"dry_run": False, "llm_eval": False}],
+                         ids=["defaults", "apply", "apply-no-eval"])
+def test_guarded_default_apply_stops_before_core(provider, guard, args):
+    """Missing/false evaluation must not bypass apply admission or mutate state."""
+    provider.p._reflect_calls_this_session = int(guard == "exhausted")
+    provider.p._agent_context = "cron" if guard == "cron" else "primary"
+    used = provider.p._reflect_calls_this_session
+    before = snapshot(provider)
+    result = execute(provider, args)
+    assert result["status"] == "skipped"
+    assert result["reason"] == ("reflect_budget_exhausted" if guard == "exhausted" else "reflect_disabled_for_cron")
+    assert provider.p._reflect_calls_this_session == used
+    assert not provider.calls and not provider.transport_calls and not costs(provider)
+    assert snapshot(provider) == before
+
+
 def test_missing_resolver_is_unavailable_without_reservation(provider):
     """Older/missing core method is a structured unavailable response, not work."""
     provider.p._beam = SimpleNamespace(session_id=provider.b.session_id)
