@@ -191,12 +191,19 @@ CROSS_SESSION_RESOLVE_SCHEMA = {
         "properties": {
             "dry_run": {
                 "type": "boolean",
-                "description": "If true, report what would be resolved without writing changes.",
+                "description": "If true, preview resolution without superseding memories or emitting an apply audit. LLM evaluation may still write cost records.",
                 "default": False,
             },
             "llm_eval": {
                 "type": "boolean",
-                "description": "Only meaningful with dry_run=true: also run LLM verification on flagged pairs (without mutating) so the exact apply-time verdict can be previewed. Default false keeps the dry run deterministic (no LLM calls).",
+                "description": (
+                    "Only meaningful with dry_run=true: run LLM verification on "
+                    "flagged pairs without superseding memories. Can incur costs "
+                    "and write cost records; reserves one reflection call and "
+                    "obeys cron/budget guards. Overrides the LLM detection flag "
+                    "for preview, not the cross-session gate. Default false "
+                    "keeps the dry run deterministic (no LLM calls or reservation)."
+                ),
                 "default": False,
             },
         },

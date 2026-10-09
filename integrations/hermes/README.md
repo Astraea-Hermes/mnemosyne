@@ -277,10 +277,31 @@ No required config. Everything defaults to `~/.mnemosyne/`. Optional overrides:
 | `MNEMOSYNE_PREFETCH_CANONICAL_GENERIC_TOKENS` | path-specific built-in canonical set | Complete replacement for the canonical generic-token set used by automatic and explicit canonical lookup; does not affect working/episodic prefetch |
 | `MNEMOSYNE_PREFETCH_CANONICAL_EXTRA_GENERIC_TOKENS` | _(empty)_ | Extra owner/deployment terms added to automatic canonical prefetch only |
 | `MNEMOSYNE_DEFAULT_SCOPE` | `session` | Default scope for remember (`global` enables cross-session immediate recall) |
-| `MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION` | `0` | Enables the `mnemosyne_resolve_conflicts` tool for global-scope memories. It does **not** run automatically: supersession only happens on an explicit apply. `dry_run=True` reports candidate pairs without mutating; `dry_run=False` applies superseding changes (LLM-confirmed when `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on). Automatic resolution during sleep is not yet enabled. |
+| `MNEMOSYNE_CROSS_SESSION_CONFLICT_RESOLUTION` | `0` | Enables execution of `mnemosyne_resolve_conflicts` for global-scope memories. It does **not** run automatically. `dry_run` defaults to `False` (apply); set `True` to preview without superseding memories or emitting an apply audit. Default-false `llm_eval` keeps previews deterministic; explicit `dry_run=True,llm_eval=True` can incur LLM costs and write cost records. Automatic resolution during sleep is not yet enabled. |
 | `MNEMOSYNE_CROSS_SESSION_MIN_GAP_HOURS` | `0` | Minimum hour-gap between cross-session candidate pairs before they are flagged for contradiction (relaxed to 0 for independent threads) |
 | `MNEMOSYNE_CROSS_SESSION_MAX_CANDIDATES` | `10000` | Per-bank row cap for the cross-session candidate scan (bounds the pairwise comparison and embedding load); truncation is reported in the tool result |
-| `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS` | `20` | Per-run cap on LLM confirmation calls during an apply. Each call is a network round-trip that runs while the shared Beam access lock is held (it serializes auto-sleep and every other tool); the cap bounds that work. The tool reports `llm_cap_reached` in its result when the cap was hit (alongside `candidates_truncated` for the row cap), so operators can tell when candidate pairs remain pending for a later explicit run |
+| `MNEMOSYNE_CROSS_SESSION_MAX_LLM_VALIDATIONS` | `20` | Per-run cap on pair validations during apply or an explicit LLM preview. A validation may retry its transport; this is not an exact HTTP-request or dollar cap. The tool reports `llm_cap_reached` when the cap was hit (alongside `candidates_truncated` for the row cap), so operators can tell when candidate pairs remain pending for a later explicit run |
+
+Both the standalone `mnemosyne_hermes` provider and the bundled
+`hermes_memory_provider` copy expose the same `dry_run`/`llm_eval` resolver
+arguments during migration; this is not a recommendation to install the bundled
+copy. The existing core `BeamMemory.resolve_cross_session_conflicts` signature
+supports both arguments. The declared release pair is core 4.0.0b5 and provider
+0.7.5; no fallback retry against an incompatible core signature is performed.
+
+An explicit LLM preview overrides `MNEMOSYNE_LLM_CONFLICT_DETECTION` for that
+preview only, never the default-off cross-session gate. Apply still honors the
+LLM detection flag and retains the existing heuristic behavior when it is off.
+Apply and evaluated preview reserve **one reflection invocation**, not one slot
+per pair or a dollar budget. Exhausted quota or a cron-disabled reflection
+context returns `skipped` before core execution. This corrects the standalone
+provider's former evaluated-preview bypass. Missing/false `llm_eval` previews
+remain deterministic, with no LLM calls, cost records or quota reservation even
+under exhausted/cron guards. Reservations are conservative and not refunded
+when the resolver is disabled, a verdict vetoes the pair, parsing fails or the
+transport fails. A missing resolver method returns `unavailable` without
+reservation. Cost logging occurs only after a valid verdict; absent cost records
+after a failed call do not prove a real endpoint charged nothing.
 
 Or in `~/.hermes/config.yaml`:
 
