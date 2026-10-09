@@ -543,7 +543,19 @@ CROSS_SESSION_RESOLVE_SCHEMA = {
         "properties": {
             "dry_run": {
                 "type": "boolean",
-                "description": "If true, report what would be resolved without writing changes.",
+                "description": "If true, preview resolution without superseding memories or emitting an apply audit. LLM evaluation may still write cost records.",
+                "default": False,
+            },
+            "llm_eval": {
+                "type": "boolean",
+                "description": (
+                    "Only meaningful with dry_run=true: run LLM verification on "
+                    "flagged pairs without superseding memories. Can incur costs "
+                    "and write cost records; reserves one reflection call and "
+                    "obeys cron/budget guards. Overrides the LLM detection flag "
+                    "for preview, not the cross-session gate. Default false "
+                    "keeps the dry run deterministic (no LLM calls or reservation)."
+                ),
                 "default": False,
             },
         },
@@ -3162,11 +3174,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
         """Invoke the opt-in cross-session conflict resolver.
 
-        `dry_run=True` reports candidate pairs without mutating; `dry_run=False`
-        applies supersessions. The apply path reserves the reflection budget (it
-        can issue one LLM validation request per flagged pair when
-        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
+        `dry_run=True` previews without superseding memories or apply audits.
+        Explicit `llm_eval=True` can call the LLM and write cost records even
+        when the LLM detection flag is off. Apply and evaluated preview reserve
+        one reflection call before core execution, without refunds."""
         dry_run = bool(args.get("dry_run", False))
+        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -3175,12 +3188,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls, so they need no budget.
-        if not dry_run:
+        # deterministic and make no LLM calls unless llm_eval is requested.
+        if not dry_run or llm_eval:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
-        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        result = self._beam.resolve_cross_session_conflicts(
+            dry_run=dry_run,
+            llm_eval=llm_eval,
+        )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
                 self._audit_event(

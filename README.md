@@ -360,6 +360,17 @@ See [docs/configuration.md#custom-embedding-models](docs/configuration.md#custom
 
 When used with Hermes Agent, Mnemosyne exposes provider tools for the memory lifecycle, lifecycle hooks for automatic context injection, and MCP support.
 
+`mnemosyne_resolve_conflicts` remains gated off by default. Its `dry_run`
+argument defaults to `false` (apply): use `dry_run=true` for deterministic
+preview, with no LLM calls or reflection reservation. Explicit
+`dry_run=true,llm_eval=true` previews LLM verdicts without superseding memories
+or emitting an apply audit, but can incur costs, write cost records and consume
+one reflection invocation. Evaluated previews now obey exhausted/cron guards
+instead of bypassing them. Both concrete Hermes provider copies expose these
+default-false arguments during migration; no core/MCP schema expansion is
+implied. See the [provider resolver contract](integrations/hermes/README.md#configuration)
+for gates, conservative reservation and cost-logging limits.
+
 > **For the full Hermes setup guide, see [docs/hermes-integration.md](docs/hermes-integration.md).** That is the canonical, most up-to-date reference.
 
 ### Install profile comparison
