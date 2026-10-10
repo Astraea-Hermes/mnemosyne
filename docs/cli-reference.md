@@ -31,9 +31,11 @@ The three flags on `sleep` are parsed but undocumented in the built-in help. `--
 | `doctor` | `doctor [--db PATH \| --bank NAME] [--format json\|markdown\|both]`. Bounded, read-only health report |
 | `repair` | `repair --report REPORT.json --select working_memory:ID [--apply]`. Applies one narrow doctor-gated fix |
 | `verify` | `verify [db_path] [--quick]`. Integrity check |
-| `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
+| `reindex` | `reindex [--db PATH \| --bank NAME] [--model NAME] [--batch-size N] [--dry-run] [--yes] [--no-backup]`. Re-embeds everything and rebuilds the sqlite-vec tables |
 
 `reindex` is the recovery path for a vector dimension mismatch. It is synchronous, backs up first unless told otherwise, and prompts unless `--yes`. Its `--dry-run` option prints a rebuild plan without writing.
+
+`--batch-size N` sets the maximum number of source texts embedded per batch for both working and episodic memory (default **64**). For an API endpoint capped at 10 inputs per request, use `mnemosyne reindex --batch-size 8`. Smaller batches do not truncate texts or retry rejected requests. A missing, malformed, zero, or negative value is rejected before target resolution, model setup, database opening, or backup creation, including with `--dry-run`.
 
 For automation, do not treat a non-zero exit from a non-dry-run `mnemosyne reindex` as success: it means the vector rebuild did not complete. A rebuild that did not complete changes nothing: it runs as a single transaction (and holds the database write lock until it commits), so a failed or killed run leaves the previous vectors and format marker in place and the command can simply be run again. Likewise, non-dry-run `mnemosyne diagnose --repair-vec-working` exits non-zero unless the requested repair reaches `repaired`; its `--dry-run` mode reports what it would repair without writing.
 

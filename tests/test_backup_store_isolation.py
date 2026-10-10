@@ -106,7 +106,7 @@ def test_targeted_reindex_backup_stays_out_of_default_backups(monkeypatch, tmp_p
     monkeypatch.setattr(
         beam,
         "reindex_vectors",
-        lambda conn, progress=None: {"model": "fake", "dim": 4},
+        lambda conn, batch_size=64, progress=None: {"model": "fake", "dim": 4},
     )
 
     cli.cmd_reindex(["--db", str(other_db), "--yes"])
@@ -205,7 +205,7 @@ def test_targeted_bank_backups_get_one_directory_per_store(monkeypatch, tmp_path
     monkeypatch.setattr(
         beam,
         "reindex_vectors",
-        lambda conn, progress=None: {"model": "fake", "dim": 4},
+        lambda conn, batch_size=64, progress=None: {"model": "fake", "dim": 4},
     )
 
     cli.cmd_reindex(["--bank", "work", "--yes"])
