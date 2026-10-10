@@ -249,7 +249,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.7.6"
+__version__ = "0.7.7"
 
 logger = logging.getLogger(__name__)
 
@@ -1164,6 +1164,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     _SYNC_TURN_SLOW_THRESHOLD_SECONDS = _parse_env_float("MNEMOSYNE_SYNC_TURN_SLOW_THRESHOLD", 5)
 
     def __init__(self):
+        # HOTFIX 2026-10-10 (FAMSERVER dashboard/ghwake crash): _beam is a
+        # call-time binding PROPERTY. Its first write went through
+        # _write_slot() BEFORE the bindings registry existed, so in any
+        # process whose turn/construction scope resolves to a non-"default"
+        # home key — every real deployment, because Hermes bootstrappers pin
+        # HERMES_HOME — the fail-closed guard raised during __init__ itself:
+        # "no binding for the current home ... refusing to write through
+        # another home's binding". The guard is correct; construction must
+        # not trip its own guard. Seed the registry (including the
+        # construction-time home key) via __dict__ BEFORE the first
+        # property write.
+        _seed: Dict[str, Dict[str, Any]] = {
+            "default": {"beam": None, "agent_identity": "", "session_id": "hermes_default"},
+        }
+        _ctor_key = _p1b_current_key()
+        if _ctor_key and _ctor_key != "default":
+            _seed[_ctor_key] = {"beam": None, "agent_identity": "", "session_id": "hermes_default"}
+        self.__dict__["_bindings"] = _seed
+        self.__dict__["_init_home"] = None
         self._beam: Optional[Any] = None
         self._surface_beam: Optional[Any] = None
         self._shared_surface_bank = "surface"
@@ -1194,9 +1213,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # last-initialized binding as out-of-turn fallback (cron/teardown keep
         # legacy behavior exactly). _beam/_agent_identity/_session_id are
         # properties over these slots; see _binding_slot below.
-        self._bindings: Dict[str, Dict[str, Any]] = {
-            "default": {"beam": None, "agent_identity": "", "session_id": "hermes_default"},
-        }
+        # HOTFIX 2026-10-10: the registry is seeded at the TOP of __init__
+        # (including the construction-time home key) so the first property
+        # write cannot fail closed against its own class. This former literal
+        # assignment is deliberately GONE — re-adding it would clobber the
+        # seeded turn-home slot and re-open the crash.
         self._ambient_key = "default"
         # Raw home string of the home currently being initialized, or None.
         # Routes binding writes to the home under construction even when no
