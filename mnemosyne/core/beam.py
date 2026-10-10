@@ -22,6 +22,7 @@ import json
 import hashlib
 import threading
 import math
+import operator
 from dataclasses import dataclass
 
 from mnemosyne.core._connection_gc import collect_connection_cycles
@@ -4191,10 +4192,22 @@ def reindex_vectors(conn: sqlite3.Connection, *, batch_size: int = 64,
     disk headroom on a large store.
 
     ``dry_run`` returns the plan (model, dim, per-store counts) without writing.
+    ``batch_size`` must support the integer index protocol (not a bool) and be
+    positive, including for dry-run.
+    Lower it for embedding endpoints with a per-request input cap; default 64.
     ``progress`` is an optional ``callable(store, done, total)`` for reporting.
     It fires after each embedded batch, before the commit, so a count it
     reports is not durable until the function returns.
     """
+    if isinstance(batch_size, bool):
+        raise ValueError("batch_size must be a positive integer")
+    try:
+        batch_size = operator.index(batch_size)
+    except TypeError as exc:
+        raise ValueError("batch_size must be a positive integer") from exc
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+
     target_dim = int(_embeddings.EMBEDDING_DIM)
     vec_type = _effective_vec_type(conn)
     vec_ok = _vec_available(conn)
