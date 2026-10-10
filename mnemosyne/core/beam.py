@@ -6853,7 +6853,15 @@ class BeamMemory:
                 # (not superseded, not expired): a concurrent resolver may have
                 # superseded either between our scan and this write, and we must
                 # not overwrite an existing successor.
-                active = "AND superseded_by IS NULL AND (valid_until IS NULL OR valid_until > ?)"
+                # ``julianday`` parses offset-bearing values chronologically:
+                # a lexical ``>`` would judge ``18:30+07:00`` (11:30Z, already
+                # expired) later than a naive ``12:00`` now because its digits
+                # sort after it. Same predicate shape as the julianday-based
+                # surfaces above.
+                active = (
+                    "AND superseded_by IS NULL "
+                    "AND (valid_until IS NULL OR julianday(valid_until) > julianday(?))"
+                )
                 replacement_found = False
                 for table in ("working_memory", "episodic_memory"):
                     cursor.execute(
@@ -13078,7 +13086,7 @@ class BeamMemory:
         max_llm_validations = max(1, int(max_llm_validations))
 
         cursor = self.conn.cursor()
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
 
         rows = []
         truncated = False
@@ -13092,7 +13100,7 @@ class BeamMemory:
                     f"SELECT id, content, source, timestamp, scope, session_id, superseded_by "
                     f"FROM {table} WHERE scope = 'global' "
                     f"AND superseded_by IS NULL "
-                    f"AND (valid_until IS NULL OR valid_until > ?) "
+                    f"AND (valid_until IS NULL OR julianday(valid_until) > julianday(?)) "
                     f"ORDER BY timestamp ASC LIMIT ?",
                     (now, max_candidates + 1),
                 )

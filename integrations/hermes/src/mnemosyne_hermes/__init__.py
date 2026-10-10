@@ -249,7 +249,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 
 logger = logging.getLogger(__name__)
 
@@ -3658,11 +3658,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _handle_resolve_conflicts(self, args: Dict[str, Any]) -> str:
         """Invoke the opt-in cross-session conflict resolver.
 
-        `dry_run=True` reports candidate pairs without mutating; `dry_run=False`
-        applies supersessions. The apply path reserves the reflection budget (it
-        can issue one LLM validation request per flagged pair when
-        `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on)."""
+        `dry_run=True` previews without superseding memories or apply audits.
+        Explicit `llm_eval=True` can call the LLM and write cost records even
+        when the LLM detection flag is off. Apply and evaluated preview reserve
+        one reflection call before core execution, without refunds."""
         dry_run = bool(args.get("dry_run", False))
+        llm_eval = bool(args.get("llm_eval", False))
         if not hasattr(self._beam, "resolve_cross_session_conflicts"):
             return json.dumps({
                 "status": "unavailable",
@@ -3671,14 +3672,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Apply can issue one LLM validation request per flagged pair when
         # MNEMOSYNE_LLM_CONFLICT_DETECTION is on; reserve the reflection budget
         # like _handle_sleep does for the same class of work. Dry runs are
-        # deterministic and make no LLM calls, so they need no budget.
-        if not dry_run:
+        # deterministic and make no LLM calls unless llm_eval is requested.
+        if not dry_run or llm_eval:
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
         result = self._beam.resolve_cross_session_conflicts(
             dry_run=dry_run,
-            llm_eval=bool(args.get("llm_eval", False)),
+            llm_eval=llm_eval,
         )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
